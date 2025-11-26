@@ -13,23 +13,25 @@ from model import GPT2WithQ
 from dataset import TokenRewardDataset, collate_fn
 
 
-def compute_discounted_returns_batch(rewards, gamma: float):
-    """Compute discounted returns from the next-step onward.
+def compute_discounted_returns_batch(rewards, gamma: float, bootstrap_values=None):
+    """Compute discounted returns from the next-step onward with optional bootstrapping.
 
     rewards: tensor (B, L)
-    returns[t] = sum_{k=t+1}^{L-1} gamma^{k-(t+1)} * r[:, k]
-    For last position returns = 0.
+    bootstrap_values: tensor (B,) - expected future value at the end of context window.
+                      If None, assumes terminal state (bootstrap=0).
+
+    returns[t] = sum_{k=t+1}^{L-1} gamma^{k-(t+1)} * r[:, k] + gamma^{L-1-t} * bootstrap
+
+    This properly handles the context window boundary by bootstrapping with
+    E_π[Q(s_L, a)] instead of assuming zero future value.
     """
     B, L = rewards.shape
     returns = torch.zeros_like(rewards)
-    # We'll compute for each sequence by reversing and doing cumulative sums
-    # For each sequence i, create r_rev = rewards[i].flip(0)
-    # then compute cumulative discounted sum and flip back, then shift by 1
-    device = rewards.device
+
     for i in range(B):
         r = rewards[i]
-        # discounted future sums starting at next position
-        future = 0.0
+        # Initialize future with bootstrap value (expected value beyond context)
+        future = bootstrap_values[i].item() if bootstrap_values is not None else 0.0
         for t in range(L - 1, -1, -1):
             # at position t, returns_t = discounted sum of rewards from t+1 onward
             returns[i, t] = future
@@ -70,8 +72,19 @@ def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0
     # Gather predicted Q for the taken actions
     q_pred = shift_q.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
 
-    # Compute return targets (discounted from next-step onward)
-    returns = compute_discounted_returns_batch(rewards, gamma)
+    # Compute bootstrap values at the context boundary: E_π[Q(s_L, a)]
+    # This is the expected Q-value under the policy distribution at the last position,
+    # which provides a proper value estimate instead of assuming zero future value.
+    with torch.no_grad():
+        # Policy distribution at last position: π(a|s_{L-1}) = softmax(logits[:, -1, :])
+        last_logits = logits[:, -1, :]  # (B, V)
+        last_q = q_values[:, -1, :]  # (B, V)
+        policy_probs = torch.softmax(last_logits, dim=-1)  # (B, V)
+        # Expected Q under policy: V = Σ_a π(a|s) * Q(s, a)
+        bootstrap_values = (policy_probs * last_q).sum(dim=-1)  # (B,)
+
+    # Compute return targets with bootstrapping at context boundary
+    returns = compute_discounted_returns_batch(rewards, gamma, bootstrap_values=bootstrap_values)
     returns_target = returns[:, :-1].contiguous()  # align with positions where next token exists
 
     # Mask out padded positions
