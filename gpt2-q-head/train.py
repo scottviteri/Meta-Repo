@@ -2,10 +2,11 @@ import math
 import random
 import argparse
 from tqdm import tqdm
+from itertools import islice
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 from datasets import load_dataset
 
@@ -355,8 +356,122 @@ def build_synthetic_dataset(tokenizer, num_examples=200, max_len=32):
     return TokenRewardDataset(examples)
 
 
+class StreamingTextDataset(IterableDataset):
+    """Streaming dataset that yields tokenized blocks from a HuggingFace dataset.
+
+    Streams data continuously without loading entire dataset into memory.
+    Each item is a dict with 'input_ids' and 'rewards'.
+    """
+
+    def __init__(self, dataset_name, config_name, tokenizer, block_size=128,
+                 text_field="text", reward_mode="zero", split="train"):
+        self.dataset_name = dataset_name
+        self.config_name = config_name
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.text_field = text_field
+        self.reward_mode = reward_mode
+        self.split = split
+
+    def __iter__(self):
+        # Load dataset in streaming mode
+        ds = load_dataset(
+            self.dataset_name,
+            self.config_name,
+            split=self.split,
+            streaming=True,
+            trust_remote_code=True
+        )
+
+        token_buffer = []
+
+        for example in ds:
+            # Tokenize the text
+            text = example[self.text_field]
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            token_buffer.extend(tokens)
+
+            # Yield complete blocks
+            while len(token_buffer) >= self.block_size:
+                block = token_buffer[:self.block_size]
+                token_buffer = token_buffer[self.block_size:]
+
+                # Generate rewards (zero by default)
+                if self.reward_mode == "zero":
+                    rewards = [0.0] * len(block)
+                else:
+                    rewards = [0.0] * len(block)
+
+                yield {"input_ids": block, "rewards": rewards}
+
+
+def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, split="train"):
+    """Build a streaming dataset for continuous training.
+
+    Args:
+        tokenizer: GPT2 tokenizer
+        dataset: Dataset name. Options:
+            - "wikipedia": wikimedia/wikipedia (English)
+            - "pile": EleutherAI/pile (if accessible)
+            - "openwebtext": Skylion007/openwebtext
+            - "c4": allenai/c4
+        block_size: tokens per example
+        split: dataset split
+
+    Returns:
+        StreamingTextDataset instance
+    """
+    dataset_configs = {
+        "wikipedia": ("wikimedia/wikipedia", "20231101.en", "text"),
+        "openwebtext": ("Skylion007/openwebtext", None, "text"),
+        "c4": ("allenai/c4", "en", "text"),
+        "pile": ("EleutherAI/pile", None, "text"),
+    }
+
+    if dataset not in dataset_configs:
+        raise ValueError(f"Unknown dataset: {dataset}. Options: {list(dataset_configs.keys())}")
+
+    ds_name, config, text_field = dataset_configs[dataset]
+
+    print(f"Loading streaming dataset: {ds_name}" + (f" ({config})" if config else ""))
+
+    return StreamingTextDataset(
+        dataset_name=ds_name,
+        config_name=config,
+        tokenizer=tokenizer,
+        block_size=block_size,
+        text_field=text_field,
+        split=split
+    )
+
+
+def streaming_collate_fn(batch, pad_token_id):
+    """Collate function for streaming dataset batches."""
+    input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
+    rewards = [torch.tensor(item["rewards"], dtype=torch.float) for item in batch]
+
+    # Pad sequences (though streaming should yield fixed-size blocks)
+    max_len = max(len(ids) for ids in input_ids)
+    padded_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
+    padded_rewards = torch.zeros((len(batch), max_len), dtype=torch.float)
+    attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+
+    for i, (ids, rew) in enumerate(zip(input_ids, rewards)):
+        padded_ids[i, :len(ids)] = ids
+        padded_rewards[i, :len(rew)] = rew
+        attention_mask[i, :len(ids)] = 1
+
+    return {
+        "input_ids": padded_ids,
+        "rewards": padded_rewards,
+        "attention_mask": attention_mask,
+    }
+
+
 def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, reward_mode="zero"):
     """Load Wikipedia via Hugging Face `datasets`, tokenize, and chunk into blocks.
+
+    NOTE: For large-scale training, prefer build_streaming_dataset() instead.
 
     Args:
         tokenizer: a GPT2 tokenizer
@@ -366,11 +481,10 @@ def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, 
         reward_mode: "zero" (default) or "lm_ref" (not implemented here)
     """
     # load a recent English Wikipedia snapshot
-    # using the 20220301 snapshot name; if unavailable, HF will pick a matching config
-    dataset_name = "wikipedia"
-    config_name = "20220301.en"
+    dataset_name = "wikimedia/wikipedia"
+    config_name = "20231101.en"
 
-    ds = load_dataset(dataset_name, config_name, split=split)
+    ds = load_dataset(dataset_name, config_name, split=split, trust_remote_code=True)
     if fraction is not None and 0.0 < fraction < 1.0:
         # take an approximate fraction by slicing
         total = len(ds)
@@ -409,18 +523,31 @@ def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=3)
+    # Training mode: steps (streaming) or epochs (finite dataset)
+    parser.add_argument("--steps", type=int, default=None, help="Number of training steps (for streaming mode)")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs (for finite dataset mode)")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (auto-scaled if not specified)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--q_weight", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no_reference", action="store_true", help="Skip training reference model")
-    parser.add_argument("--log_interval", type=int, default=10, help="Log every N batches")
-    parser.add_argument("--max_len", type=int, default=48, help="Maximum sequence length")
+    parser.add_argument("--log_interval", type=int, default=100, help="Log every N steps")
+    parser.add_argument("--max_len", type=int, default=128, help="Maximum sequence length (block size)")
     parser.add_argument("--plot_diagnostics", action="store_true", help="Plot Q diagnostics at end of training")
     parser.add_argument("--plot_path", type=str, default="q_diagnostics.png", help="Path for diagnostics plot")
+    # Dataset options
+    parser.add_argument("--dataset", type=str, default="synthetic",
+                        choices=["synthetic", "wikipedia", "openwebtext", "c4", "pile"],
+                        help="Dataset to use for training")
     args = parser.parse_args()
+
+    # Default to steps mode for streaming datasets, epochs for synthetic
+    if args.steps is None and args.epochs is None:
+        if args.dataset == "synthetic":
+            args.epochs = 3
+        else:
+            args.steps = 10000  # Default 10k steps for streaming
 
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     # ensure padding token exists
@@ -433,8 +560,23 @@ def main():
     else:
         print(f"Using specified batch size: {args.batch_size}")
 
-    dataset = build_synthetic_dataset(tokenizer, num_examples=400, max_len=args.max_len)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id))
+    # Build dataset based on selection
+    if args.dataset == "synthetic":
+        print("Using synthetic dataset (epoch-based training)")
+        dataset = build_synthetic_dataset(tokenizer, num_examples=400, max_len=args.max_len)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+        )
+        streaming = False
+    else:
+        print(f"Using {args.dataset} dataset (streaming, step-based training)")
+        dataset = build_streaming_dataset(tokenizer, dataset=args.dataset, block_size=args.max_len)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size,
+            collate_fn=lambda b: streaming_collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+        )
+        streaming = True
 
     # Model with Q-head
     model = GPT2WithQ("gpt2")
@@ -454,16 +596,30 @@ def main():
         ref_optimizer = None
         print("Training Q-head model only...")
 
-    print(f"{'='*70}")
-    print(f"{'Batch':>6} | {'Q-Model PPL':>12} {'Q-Model LM':>12} {'Q-Loss':>10} | {'Ref PPL':>12} {'Ref LM':>10}")
-    print(f"{'='*70}")
+    print(f"{'='*80}")
+    print(f"{'Step':>8} | {'Q-Model PPL':>12} {'Q-Model LM':>12} {'Q-Loss':>10} | {'Ref PPL':>12} {'Ref LM':>10}")
+    print(f"{'='*80}")
 
-    for epoch in range(args.epochs):
-        total = 0
-        acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
-        acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+    # Unified training loop for both streaming and epoch-based modes
+    global_step = 0
+    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+    acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+    interval_count = 0
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+    if streaming or args.steps is not None:
+        # Step-based training (streaming mode)
+        total_steps = args.steps or 10000
+        data_iter = iter(dataloader)
+        pbar = tqdm(total=total_steps, desc="Training")
+
+        while global_step < total_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # Restart iterator if dataset exhausted (shouldn't happen with streaming)
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
             # Train Q-head model
             stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma, q_loss_weight=args.q_weight, device=args.device)
             for k, v in stats_q.items():
@@ -475,37 +631,85 @@ def main():
                 for k, v in stats_ref.items():
                     acc_ref[k] += v
 
-            total += 1
+            global_step += 1
+            interval_count += 1
+            pbar.update(1)
 
-            # Log diagnostics every N batches
-            if (batch_idx + 1) % args.log_interval == 0:
-                q_ppl = acc_q["perplexity"] / total
-                q_lm = acc_q["lm_loss"] / total
-                q_loss = acc_q["q_loss"] / total
+            # Log diagnostics every N steps
+            if global_step % args.log_interval == 0:
+                q_ppl = acc_q["perplexity"] / interval_count
+                q_lm = acc_q["lm_loss"] / interval_count
+                q_loss = acc_q["q_loss"] / interval_count
                 if ref_model is not None:
-                    ref_ppl = acc_ref["perplexity"] / total
-                    ref_lm = acc_ref["lm_loss"] / total
+                    ref_ppl = acc_ref["perplexity"] / interval_count
+                    ref_lm = acc_ref["lm_loss"] / interval_count
                     ppl_diff = q_ppl - ref_ppl
-                    print(f"{batch_idx+1:>6} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
+                    tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
                 else:
-                    print(f"{batch_idx+1:>6} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                    tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                # Reset interval accumulators
+                acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                interval_count = 0
 
-        # Epoch summary
-        print(f"{'-'*70}")
-        q_ppl = acc_q["perplexity"] / total
-        q_lm = acc_q["lm_loss"] / total
-        q_loss = acc_q["q_loss"] / total
-        if ref_model is not None:
-            ref_ppl = acc_ref["perplexity"] / total
-            ref_lm = acc_ref["lm_loss"] / total
-            ppl_diff = q_ppl - ref_ppl
-            print(f"Epoch {epoch+1} Summary:")
-            print(f"  Q-Model:   PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
-            print(f"  Reference: PPL={ref_ppl:.2f}, LM Loss={ref_lm:.4f}")
-            print(f"  Δ PPL (Q - Ref): {ppl_diff:+.2f}")
-        else:
-            print(f"Epoch {epoch+1}: PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
-        print(f"{'='*70}")
+        pbar.close()
+    else:
+        # Epoch-based training (finite dataset)
+        for epoch in range(args.epochs):
+            epoch_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+            epoch_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+            epoch_count = 0
+
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+                # Train Q-head model
+                stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma, q_loss_weight=args.q_weight, device=args.device)
+                for k, v in stats_q.items():
+                    epoch_q[k] += v
+                    acc_q[k] += v
+
+                # Train reference model on same batch
+                if ref_model is not None:
+                    stats_ref = train_step_reference(ref_model, batch, ref_optimizer, device=args.device)
+                    for k, v in stats_ref.items():
+                        epoch_ref[k] += v
+                        acc_ref[k] += v
+
+                global_step += 1
+                epoch_count += 1
+                interval_count += 1
+
+                # Log diagnostics every N batches
+                if global_step % args.log_interval == 0:
+                    q_ppl = acc_q["perplexity"] / interval_count
+                    q_lm = acc_q["lm_loss"] / interval_count
+                    q_loss = acc_q["q_loss"] / interval_count
+                    if ref_model is not None:
+                        ref_ppl = acc_ref["perplexity"] / interval_count
+                        ref_lm = acc_ref["lm_loss"] / interval_count
+                        ppl_diff = q_ppl - ref_ppl
+                        tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
+                    else:
+                        tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                    acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                    interval_count = 0
+
+            # Epoch summary
+            print(f"{'-'*80}")
+            q_ppl = epoch_q["perplexity"] / epoch_count
+            q_lm = epoch_q["lm_loss"] / epoch_count
+            q_loss = epoch_q["q_loss"] / epoch_count
+            if ref_model is not None:
+                ref_ppl = epoch_ref["perplexity"] / epoch_count
+                ref_lm = epoch_ref["lm_loss"] / epoch_count
+                ppl_diff = q_ppl - ref_ppl
+                print(f"Epoch {epoch+1} Summary:")
+                print(f"  Q-Model:   PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
+                print(f"  Reference: PPL={ref_ppl:.2f}, LM Loss={ref_lm:.4f}")
+                print(f"  Δ PPL (Q - Ref): {ppl_diff:+.2f}")
+            else:
+                print(f"Epoch {epoch+1}: PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
+            print(f"{'='*80}")
 
     # Generate position-wise diagnostics at end of training
     if args.plot_diagnostics or True:  # Always compute, optionally plot
