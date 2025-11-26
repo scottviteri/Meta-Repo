@@ -1,11 +1,14 @@
+import os
 import math
 import random
 import argparse
 from tqdm import tqdm
+from itertools import islice
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 from datasets import load_dataset
 
@@ -15,8 +18,130 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 from model import GPT2WithQ
 from dataset import TokenRewardDataset, collate_fn
+
+
+# =============================================================================
+# Q-Tilted Sampling for Inference
+# =============================================================================
+
+def sample_with_q_tilt(model, input_ids, beta=1.0, temperature=1.0, top_k=None, top_p=None):
+    """Sample next token using Q-tilted distribution.
+
+    The tilted distribution is derived from KL-constrained optimization:
+        max_π' E_a~π'[Q(s,a)] - β·KL(π'||π)
+
+    This has closed-form solution:
+        π'(a|s) ∝ π(a|s) · exp(Q(s,a)/β)
+
+    In logit space:
+        logits' = logits + Q/β
+
+    Args:
+        model: GPT2WithQ model
+        input_ids: tensor (B, L) of input token ids
+        beta: KL penalty weight. Higher β = closer to original policy.
+              Lower β = more Q-seeking. β→∞ recovers π, β→0 picks argmax Q.
+        temperature: softmax temperature for final sampling
+        top_k: if set, restrict to top-k tokens before sampling
+        top_p: if set, use nucleus sampling with this threshold
+
+    Returns:
+        next_token: tensor (B,) of sampled token ids
+        info: dict with logits, q_values, tilted_logits for analysis
+    """
+    model.eval()
+    with torch.no_grad():
+        logits, q_values = model(input_ids)
+
+        # Get logits and Q-values for the last position
+        last_logits = logits[:, -1, :]  # (B, V)
+        last_q = q_values[:, -1, :]  # (B, V)
+
+        # Q-tilted logits: logits' = logits + Q/β
+        # When β is large, we stay close to the LM policy
+        # When β is small, we weight heavily toward high-Q actions
+        tilted_logits = last_logits + last_q / beta
+
+        # Apply temperature
+        tilted_logits = tilted_logits / temperature
+
+        # Optional: top-k filtering
+        if top_k is not None:
+            top_k = min(top_k, tilted_logits.size(-1))
+            indices_to_remove = tilted_logits < torch.topk(tilted_logits, top_k)[0][..., -1, None]
+            tilted_logits[indices_to_remove] = float('-inf')
+
+        # Optional: nucleus (top-p) sampling
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(tilted_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            tilted_logits[indices_to_remove] = float('-inf')
+
+        # Sample from tilted distribution
+        probs = F.softmax(tilted_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        info = {
+            "logits": last_logits,
+            "q_values": last_q,
+            "tilted_logits": tilted_logits,
+            "probs": probs,
+        }
+
+    model.train()
+    return next_token, info
+
+
+def generate_with_q_tilt(model, tokenizer, prompt, max_new_tokens=50, beta=1.0,
+                         temperature=1.0, top_k=None, top_p=None, device="cpu"):
+    """Generate text using Q-tilted sampling.
+
+    Args:
+        model: GPT2WithQ model
+        tokenizer: tokenizer
+        prompt: string prompt to continue
+        max_new_tokens: number of tokens to generate
+        beta: KL penalty (higher = more like base LM, lower = more Q-seeking)
+        temperature: sampling temperature
+        top_k: top-k filtering
+        top_p: nucleus sampling threshold
+        device: device to run on
+
+    Returns:
+        generated_text: the full generated string
+        tokens: list of generated token ids
+    """
+    model.eval()
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    generated_tokens = []
+    for _ in range(max_new_tokens):
+        next_token, _ = sample_with_q_tilt(
+            model, input_ids, beta=beta, temperature=temperature,
+            top_k=top_k, top_p=top_p
+        )
+        generated_tokens.append(next_token.item())
+        input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
+
+        # Stop at EOS
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+
+    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    model.train()
+    return generated_text, generated_tokens
 
 
 def estimate_batch_size(device, seq_len=48, model_name="gpt2", safety_factor=0.7):
@@ -84,11 +209,40 @@ def compute_discounted_returns_batch(rewards, gamma: float, bootstrap_values=Non
     return returns
 
 
-def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0, device="cpu"):
+def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0, device="cpu",
+                ref_model=None, use_lm_rewards=False):
+    """Training step for GPT2WithQ model.
+
+    Args:
+        model: GPT2WithQ model to train
+        batch: dict with input_ids, attention_mask, rewards
+        optimizer: optimizer for model
+        tokenizer: tokenizer (unused but kept for API compatibility)
+        gamma: discount factor
+        q_loss_weight: weight for Q loss term
+        device: device to run on
+        ref_model: if provided and use_lm_rewards=True, compute rewards as log P(next_token)
+        use_lm_rewards: if True, use log-probs from ref_model as rewards instead of batch rewards
+    """
     model.train()
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
-    rewards = batch["rewards"].to(device)
+
+    # Compute rewards: either from batch or from reference model log-probs
+    if use_lm_rewards and ref_model is not None:
+        with torch.no_grad():
+            ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask)
+            ref_logits = ref_outputs.logits
+            # Log-probs at each position for predicting the next token
+            log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # (B, L-1, V)
+            # Gather log prob of the actual next token
+            next_tokens = input_ids[:, 1:]  # (B, L-1)
+            rewards_lm = log_probs.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+            # Pad to full length (last position has no next token, set reward to 0)
+            rewards = torch.zeros_like(input_ids, dtype=torch.float)
+            rewards[:, :-1] = rewards_lm
+    else:
+        rewards = batch["rewards"].to(device)
 
     batch_size, seq_len = input_ids.shape
 
@@ -326,6 +480,64 @@ def plot_position_diagnostics(diag, save_path="q_diagnostics.png"):
     print(f"Saved position diagnostics plot to: {save_path}")
 
 
+def save_checkpoint(model, optimizer, step, save_dir, tokenizer=None, args=None):
+    """Save model checkpoint.
+
+    Args:
+        model: GPT2WithQ model
+        optimizer: optimizer
+        step: current training step
+        save_dir: directory to save checkpoints
+        tokenizer: optional tokenizer to save
+        args: optional training args to save
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
+
+    checkpoint = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if args is not None:
+        checkpoint["args"] = vars(args)
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Also save a "latest" symlink/copy for easy loading
+    latest_path = os.path.join(save_dir, "checkpoint_latest.pt")
+    torch.save(checkpoint, latest_path)
+
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, device="cpu"):
+    """Load a checkpoint.
+
+    Args:
+        checkpoint_path: path to checkpoint file
+        model: GPT2WithQ model to load weights into
+        optimizer: optional optimizer to load state into
+        device: device to map tensors to
+
+    Returns:
+        step: training step the checkpoint was saved at
+        args: training args if saved, else None
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    step = checkpoint.get("step", 0)
+    args = checkpoint.get("args", None)
+
+    print(f"Loaded checkpoint from step {step}")
+    return step, args
+
+
 def build_synthetic_dataset(tokenizer, num_examples=200, max_len=32):
     # Generate random short sequences from some example sentences and random rewards
     texts = [
@@ -355,8 +567,122 @@ def build_synthetic_dataset(tokenizer, num_examples=200, max_len=32):
     return TokenRewardDataset(examples)
 
 
+class StreamingTextDataset(IterableDataset):
+    """Streaming dataset that yields tokenized blocks from a HuggingFace dataset.
+
+    Streams data continuously without loading entire dataset into memory.
+    Each item is a dict with 'input_ids' and 'rewards'.
+    """
+
+    def __init__(self, dataset_name, config_name, tokenizer, block_size=128,
+                 text_field="text", reward_mode="zero", split="train"):
+        self.dataset_name = dataset_name
+        self.config_name = config_name
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.text_field = text_field
+        self.reward_mode = reward_mode
+        self.split = split
+
+    def __iter__(self):
+        # Load dataset in streaming mode
+        ds = load_dataset(
+            self.dataset_name,
+            self.config_name,
+            split=self.split,
+            streaming=True,
+            trust_remote_code=True
+        )
+
+        token_buffer = []
+
+        for example in ds:
+            # Tokenize the text
+            text = example[self.text_field]
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            token_buffer.extend(tokens)
+
+            # Yield complete blocks
+            while len(token_buffer) >= self.block_size:
+                block = token_buffer[:self.block_size]
+                token_buffer = token_buffer[self.block_size:]
+
+                # Generate rewards (zero by default)
+                if self.reward_mode == "zero":
+                    rewards = [0.0] * len(block)
+                else:
+                    rewards = [0.0] * len(block)
+
+                yield {"input_ids": block, "rewards": rewards}
+
+
+def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, split="train"):
+    """Build a streaming dataset for continuous training.
+
+    Args:
+        tokenizer: GPT2 tokenizer
+        dataset: Dataset name. Options:
+            - "wikipedia": wikimedia/wikipedia (English)
+            - "pile": EleutherAI/pile (if accessible)
+            - "openwebtext": Skylion007/openwebtext
+            - "c4": allenai/c4
+        block_size: tokens per example
+        split: dataset split
+
+    Returns:
+        StreamingTextDataset instance
+    """
+    dataset_configs = {
+        "wikipedia": ("wikimedia/wikipedia", "20231101.en", "text"),
+        "openwebtext": ("Skylion007/openwebtext", None, "text"),
+        "c4": ("allenai/c4", "en", "text"),
+        "pile": ("EleutherAI/pile", None, "text"),
+    }
+
+    if dataset not in dataset_configs:
+        raise ValueError(f"Unknown dataset: {dataset}. Options: {list(dataset_configs.keys())}")
+
+    ds_name, config, text_field = dataset_configs[dataset]
+
+    print(f"Loading streaming dataset: {ds_name}" + (f" ({config})" if config else ""))
+
+    return StreamingTextDataset(
+        dataset_name=ds_name,
+        config_name=config,
+        tokenizer=tokenizer,
+        block_size=block_size,
+        text_field=text_field,
+        split=split
+    )
+
+
+def streaming_collate_fn(batch, pad_token_id):
+    """Collate function for streaming dataset batches."""
+    input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
+    rewards = [torch.tensor(item["rewards"], dtype=torch.float) for item in batch]
+
+    # Pad sequences (though streaming should yield fixed-size blocks)
+    max_len = max(len(ids) for ids in input_ids)
+    padded_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
+    padded_rewards = torch.zeros((len(batch), max_len), dtype=torch.float)
+    attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+
+    for i, (ids, rew) in enumerate(zip(input_ids, rewards)):
+        padded_ids[i, :len(ids)] = ids
+        padded_rewards[i, :len(rew)] = rew
+        attention_mask[i, :len(ids)] = 1
+
+    return {
+        "input_ids": padded_ids,
+        "rewards": padded_rewards,
+        "attention_mask": attention_mask,
+    }
+
+
 def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, reward_mode="zero"):
     """Load Wikipedia via Hugging Face `datasets`, tokenize, and chunk into blocks.
+
+    NOTE: For large-scale training, prefer build_streaming_dataset() instead.
 
     Args:
         tokenizer: a GPT2 tokenizer
@@ -366,11 +692,10 @@ def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, 
         reward_mode: "zero" (default) or "lm_ref" (not implemented here)
     """
     # load a recent English Wikipedia snapshot
-    # using the 20220301 snapshot name; if unavailable, HF will pick a matching config
-    dataset_name = "wikipedia"
-    config_name = "20220301.en"
+    dataset_name = "wikimedia/wikipedia"
+    config_name = "20231101.en"
 
-    ds = load_dataset(dataset_name, config_name, split=split)
+    ds = load_dataset(dataset_name, config_name, split=split, trust_remote_code=True)
     if fraction is not None and 0.0 < fraction < 1.0:
         # take an approximate fraction by slicing
         total = len(ds)
@@ -409,18 +734,64 @@ def build_wiki_dataset(tokenizer, split="train", block_size=128, fraction=None, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=3)
+    # Training mode: steps (streaming) or epochs (finite dataset)
+    parser.add_argument("--steps", type=int, default=None, help="Number of training steps (for streaming mode)")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs (for finite dataset mode)")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (auto-scaled if not specified)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--q_weight", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no_reference", action="store_true", help="Skip training reference model")
-    parser.add_argument("--log_interval", type=int, default=10, help="Log every N batches")
-    parser.add_argument("--max_len", type=int, default=48, help="Maximum sequence length")
+    parser.add_argument("--log_interval", type=int, default=100, help="Log every N steps")
+    parser.add_argument("--max_len", type=int, default=128, help="Maximum sequence length (block size)")
     parser.add_argument("--plot_diagnostics", action="store_true", help="Plot Q diagnostics at end of training")
     parser.add_argument("--plot_path", type=str, default="q_diagnostics.png", help="Path for diagnostics plot")
+    # Dataset options
+    parser.add_argument("--dataset", type=str, default="synthetic",
+                        choices=["synthetic", "wikipedia", "openwebtext", "c4", "pile"],
+                        help="Dataset to use for training")
+    # Weights & Biases
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="gpt2-q-head", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    # Reward mode
+    parser.add_argument("--use_lm_rewards", action="store_true",
+                        help="Use log P(next_token) from reference model as rewards instead of batch rewards")
+    # Checkpoint saving
+    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--save_interval", type=int, default=1000, help="Save checkpoint every N steps")
     args = parser.parse_args()
+
+    # Default to steps mode for streaming datasets, epochs for synthetic
+    if args.steps is None and args.epochs is None:
+        if args.dataset == "synthetic":
+            args.epochs = 3
+        else:
+            args.steps = 10000  # Default 10k steps for streaming
+
+    # Initialize Weights & Biases
+    use_wandb = args.wandb and HAS_WANDB
+    if args.wandb and not HAS_WANDB:
+        print("Warning: --wandb specified but wandb not installed. Run: pip install wandb")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "dataset": args.dataset,
+                "steps": args.steps,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "gamma": args.gamma,
+                "q_weight": args.q_weight,
+                "max_len": args.max_len,
+                "use_lm_rewards": args.use_lm_rewards,
+                "save_interval": args.save_interval,
+            }
+        )
+        print(f"W&B initialized: {wandb.run.url}")
 
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     # ensure padding token exists
@@ -430,11 +801,28 @@ def main():
     # Auto-scale batch size based on GPU memory if not specified
     if args.batch_size is None:
         args.batch_size = estimate_batch_size(args.device, seq_len=args.max_len)
+        if use_wandb:
+            wandb.config.update({"batch_size": args.batch_size})
     else:
         print(f"Using specified batch size: {args.batch_size}")
 
-    dataset = build_synthetic_dataset(tokenizer, num_examples=400, max_len=args.max_len)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id))
+    # Build dataset based on selection
+    if args.dataset == "synthetic":
+        print("Using synthetic dataset (epoch-based training)")
+        dataset = build_synthetic_dataset(tokenizer, num_examples=400, max_len=args.max_len)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            collate_fn=lambda b: collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+        )
+        streaming = False
+    else:
+        print(f"Using {args.dataset} dataset (streaming, step-based training)")
+        dataset = build_streaming_dataset(tokenizer, dataset=args.dataset, block_size=args.max_len)
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size,
+            collate_fn=lambda b: streaming_collate_fn(b, pad_token_id=tokenizer.pad_token_id)
+        )
+        streaming = True
 
     # Model with Q-head
     model = GPT2WithQ("gpt2")
@@ -443,69 +831,192 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Reference model (standard GPT-2, no Q-head) for comparison
-    if not args.no_reference:
+    # Note: ref_model is always needed if use_lm_rewards is True
+    if not args.no_reference or args.use_lm_rewards:
         ref_model = GPT2LMHeadModel.from_pretrained("gpt2")
         ref_model.resize_token_embeddings(len(tokenizer))
         ref_model.to(args.device)
-        ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=args.lr)
-        print("Training Q-head model and reference GPT-2 in lockstep...")
+        if not args.no_reference:
+            ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=args.lr)
+            print("Training Q-head model and reference GPT-2 in lockstep...")
+        else:
+            ref_optimizer = None
+            print("Training Q-head model only (using ref model for rewards)...")
     else:
         ref_model = None
         ref_optimizer = None
         print("Training Q-head model only...")
 
-    print(f"{'='*70}")
-    print(f"{'Batch':>6} | {'Q-Model PPL':>12} {'Q-Model LM':>12} {'Q-Loss':>10} | {'Ref PPL':>12} {'Ref LM':>10}")
-    print(f"{'='*70}")
+    if args.use_lm_rewards:
+        print("Using log P(next_token) from reference model as rewards")
+    else:
+        print("Using dataset rewards (zero for streaming, random for synthetic)")
 
-    for epoch in range(args.epochs):
-        total = 0
-        acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
-        acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+    print(f"{'='*80}")
+    print(f"{'Step':>8} | {'Q-Model PPL':>12} {'Q-Model LM':>12} {'Q-Loss':>10} | {'Ref PPL':>12} {'Ref LM':>10}")
+    print(f"{'='*80}")
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+    # Unified training loop for both streaming and epoch-based modes
+    global_step = 0
+    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+    acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+    interval_count = 0
+
+    if streaming or args.steps is not None:
+        # Step-based training (streaming mode)
+        total_steps = args.steps or 10000
+        data_iter = iter(dataloader)
+        pbar = tqdm(total=total_steps, desc="Training")
+
+        while global_step < total_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # Restart iterator if dataset exhausted (shouldn't happen with streaming)
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
             # Train Q-head model
-            stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma, q_loss_weight=args.q_weight, device=args.device)
+            stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
+                                 q_loss_weight=args.q_weight, device=args.device,
+                                 ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
             for k, v in stats_q.items():
                 acc_q[k] += v
 
-            # Train reference model on same batch
-            if ref_model is not None:
+            # Train reference model on same batch (only if we're actually training it)
+            if ref_optimizer is not None:
                 stats_ref = train_step_reference(ref_model, batch, ref_optimizer, device=args.device)
                 for k, v in stats_ref.items():
                     acc_ref[k] += v
 
-            total += 1
+            global_step += 1
+            interval_count += 1
+            pbar.update(1)
 
-            # Log diagnostics every N batches
-            if (batch_idx + 1) % args.log_interval == 0:
-                q_ppl = acc_q["perplexity"] / total
-                q_lm = acc_q["lm_loss"] / total
-                q_loss = acc_q["q_loss"] / total
-                if ref_model is not None:
-                    ref_ppl = acc_ref["perplexity"] / total
-                    ref_lm = acc_ref["lm_loss"] / total
+            # Save checkpoint at regular intervals
+            if global_step % args.save_interval == 0:
+                save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
+
+            # Log diagnostics every N steps
+            if global_step % args.log_interval == 0:
+                q_ppl = acc_q["perplexity"] / interval_count
+                q_lm = acc_q["lm_loss"] / interval_count
+                q_loss = acc_q["q_loss"] / interval_count
+
+                # W&B logging
+                if use_wandb:
+                    log_dict = {
+                        "step": global_step,
+                        "q_model/perplexity": q_ppl,
+                        "q_model/lm_loss": q_lm,
+                        "q_model/q_loss": q_loss,
+                    }
+                    if ref_optimizer is not None:
+                        ref_ppl = acc_ref["perplexity"] / interval_count
+                        ref_lm = acc_ref["lm_loss"] / interval_count
+                        log_dict["ref_model/perplexity"] = ref_ppl
+                        log_dict["ref_model/lm_loss"] = ref_lm
+                        log_dict["delta_ppl"] = q_ppl - ref_ppl
+                    wandb.log(log_dict, step=global_step)
+
+                if ref_optimizer is not None:
+                    ref_ppl = acc_ref["perplexity"] / interval_count
+                    ref_lm = acc_ref["lm_loss"] / interval_count
                     ppl_diff = q_ppl - ref_ppl
-                    print(f"{batch_idx+1:>6} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
+                    tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
                 else:
-                    print(f"{batch_idx+1:>6} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                    tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                # Reset interval accumulators
+                acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                interval_count = 0
 
-        # Epoch summary
-        print(f"{'-'*70}")
-        q_ppl = acc_q["perplexity"] / total
-        q_lm = acc_q["lm_loss"] / total
-        q_loss = acc_q["q_loss"] / total
-        if ref_model is not None:
-            ref_ppl = acc_ref["perplexity"] / total
-            ref_lm = acc_ref["lm_loss"] / total
-            ppl_diff = q_ppl - ref_ppl
-            print(f"Epoch {epoch+1} Summary:")
-            print(f"  Q-Model:   PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
-            print(f"  Reference: PPL={ref_ppl:.2f}, LM Loss={ref_lm:.4f}")
-            print(f"  Δ PPL (Q - Ref): {ppl_diff:+.2f}")
-        else:
-            print(f"Epoch {epoch+1}: PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
-        print(f"{'='*70}")
+        pbar.close()
+    else:
+        # Epoch-based training (finite dataset)
+        for epoch in range(args.epochs):
+            epoch_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+            epoch_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+            epoch_count = 0
+
+            for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+                # Train Q-head model
+                stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
+                                     q_loss_weight=args.q_weight, device=args.device,
+                                     ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
+                for k, v in stats_q.items():
+                    epoch_q[k] += v
+                    acc_q[k] += v
+
+                # Train reference model on same batch (only if we're actually training it)
+                if ref_optimizer is not None:
+                    stats_ref = train_step_reference(ref_model, batch, ref_optimizer, device=args.device)
+                    for k, v in stats_ref.items():
+                        epoch_ref[k] += v
+                        acc_ref[k] += v
+
+                global_step += 1
+                epoch_count += 1
+                interval_count += 1
+
+                # Save checkpoint at regular intervals
+                if global_step % args.save_interval == 0:
+                    save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
+
+                # Log diagnostics every N batches
+                if global_step % args.log_interval == 0:
+                    q_ppl = acc_q["perplexity"] / interval_count
+                    q_lm = acc_q["lm_loss"] / interval_count
+                    q_loss = acc_q["q_loss"] / interval_count
+
+                    # W&B logging
+                    if use_wandb:
+                        log_dict = {
+                            "step": global_step,
+                            "epoch": epoch + 1,
+                            "q_model/perplexity": q_ppl,
+                            "q_model/lm_loss": q_lm,
+                            "q_model/q_loss": q_loss,
+                        }
+                        if ref_optimizer is not None:
+                            ref_ppl = acc_ref["perplexity"] / interval_count
+                            ref_lm = acc_ref["lm_loss"] / interval_count
+                            log_dict["ref_model/perplexity"] = ref_ppl
+                            log_dict["ref_model/lm_loss"] = ref_lm
+                            log_dict["delta_ppl"] = q_ppl - ref_ppl
+                        wandb.log(log_dict, step=global_step)
+
+                    if ref_optimizer is not None:
+                        ref_ppl = acc_ref["perplexity"] / interval_count
+                        ref_lm = acc_ref["lm_loss"] / interval_count
+                        ppl_diff = q_ppl - ref_ppl
+                        tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
+                    else:
+                        tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
+                    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                    acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                    interval_count = 0
+
+            # Epoch summary
+            print(f"{'-'*80}")
+            q_ppl = epoch_q["perplexity"] / epoch_count
+            q_lm = epoch_q["lm_loss"] / epoch_count
+            q_loss = epoch_q["q_loss"] / epoch_count
+            if ref_optimizer is not None:
+                ref_ppl = epoch_ref["perplexity"] / epoch_count
+                ref_lm = epoch_ref["lm_loss"] / epoch_count
+                ppl_diff = q_ppl - ref_ppl
+                print(f"Epoch {epoch+1} Summary:")
+                print(f"  Q-Model:   PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
+                print(f"  Reference: PPL={ref_ppl:.2f}, LM Loss={ref_lm:.4f}")
+                print(f"  Δ PPL (Q - Ref): {ppl_diff:+.2f}")
+            else:
+                print(f"Epoch {epoch+1}: PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
+            print(f"{'='*80}")
+
+    # Save final checkpoint
+    save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
+    print(f"\nTraining complete. Final checkpoint saved at step {global_step}")
 
     # Generate position-wise diagnostics at end of training
     if args.plot_diagnostics or True:  # Always compute, optionally plot
@@ -527,6 +1038,12 @@ def main():
 
         if args.plot_diagnostics:
             plot_position_diagnostics(diag, save_path=args.plot_path)
+            if use_wandb:
+                wandb.log({"diagnostics_plot": wandb.Image(args.plot_path)})
+
+    # Finish W&B run
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
