@@ -162,37 +162,62 @@ def create_pdf():
         "L<sub>Q</sub> = (1/N) · Σ<sub>t</sub> (Q(s<sub>t</sub>, a<sub>t</sub>) − G<sub>t</sub>)²",
         equation_style
     ))
-    story.append(Paragraph("where G<sub>t</sub> is the discounted return from position t+1 onward:", body_style))
+    story.append(Paragraph("where G<sub>t</sub> is the discounted return from position t+1 onward, with bootstrapping:", body_style))
     story.append(Paragraph(
-        "G<sub>t</sub> = Σ<sub>k=t+1</sub><sup>T−1</sup> γ<sup>k−(t+1)</sup> · r<sub>k</sub>",
+        "G<sub>t</sub> = Σ<sub>k=t+1</sub><sup>L−1</sup> γ<sup>k−(t+1)</sup> · r<sub>k</sub> + γ<sup>L−1−t</sup> · V<sub>bootstrap</sub>",
         equation_style
     ))
     story.append(Paragraph(
         "Here γ is the discount factor (default 0.99) and r<sub>k</sub> is the reward at position k. "
-        "Note that G<sub>t</sub> represents future rewards starting from the NEXT position, not the current one.",
+        "The bootstrap term V<sub>bootstrap</sub> handles the context window boundary (see Section 4).",
         body_style
     ))
 
     # Computing Discounted Returns
-    story.append(Paragraph("4. Computing Discounted Returns", section_style))
+    story.append(Paragraph("4. Computing Discounted Returns with Bootstrapping", section_style))
     story.append(Paragraph(
-        "The discounted returns are computed via dynamic programming, working backwards "
-        "through the sequence:",
+        "A key challenge is handling the context window boundary. The sequence doesn't truly end "
+        "at position L—it's an arbitrary truncation. Treating it as a terminal state (future value = 0) "
+        "would bias Q-estimates downward near the boundary.",
         body_style
     ))
 
-    code_text = """def compute_discounted_returns(rewards, gamma):
+    story.append(Paragraph("4.1 Bootstrap Value at Context Boundary", subsection_style))
+    story.append(Paragraph(
+        "Instead, we bootstrap using the expected Q-value under the current policy at the last position:",
+        body_style
+    ))
+    story.append(Paragraph(
+        "V<sub>bootstrap</sub> = E<sub>a∼π</sub>[Q(s<sub>L−1</sub>, a)] = Σ<sub>a</sub> π(a|s<sub>L−1</sub>) · Q(s<sub>L−1</sub>, a)",
+        equation_style
+    ))
+    story.append(Paragraph(
+        "where π(a|s) = softmax(logits) is the policy distribution from the LM head. This computes "
+        "the inner product between the predicted next-token distribution and the Q-values over all actions, "
+        "giving an estimate of expected future value beyond the context window.",
+        body_style
+    ))
+
+    story.append(Paragraph("4.2 Backward Dynamic Programming", subsection_style))
+    story.append(Paragraph(
+        "The discounted returns are computed via dynamic programming, working backwards "
+        "from the bootstrap value:",
+        body_style
+    ))
+
+    code_text = """def compute_discounted_returns(rewards, gamma, bootstrap):
     returns = zeros_like(rewards)
-    future = 0.0
-    for t in range(T-1, -1, -1):
+    future = bootstrap  # E_π[Q(s_L, a)] instead of 0
+    for t in range(L-1, -1, -1):
         returns[t] = future
         future = rewards[t] + gamma * future
     return returns"""
     story.append(Preformatted(code_text, code_style))
 
     story.append(Paragraph(
-        "This ensures that returns[t] contains the discounted sum of all rewards from t+1 to T−1, "
-        "which is exactly what Q(s<sub>t</sub>, a<sub>t</sub>) should predict for the optimal policy.",
+        "This ensures that returns[t] properly accounts for value beyond the context window. "
+        "For n tokens remaining until the boundary, this effectively computes an n-step TD target "
+        "that bootstraps with the expected Q-value.",
         body_style
     ))
 
