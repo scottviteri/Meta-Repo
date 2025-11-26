@@ -1,3 +1,4 @@
+import os
 import math
 import random
 import argparse
@@ -208,11 +209,40 @@ def compute_discounted_returns_batch(rewards, gamma: float, bootstrap_values=Non
     return returns
 
 
-def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0, device="cpu"):
+def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0, device="cpu",
+                ref_model=None, use_lm_rewards=False):
+    """Training step for GPT2WithQ model.
+
+    Args:
+        model: GPT2WithQ model to train
+        batch: dict with input_ids, attention_mask, rewards
+        optimizer: optimizer for model
+        tokenizer: tokenizer (unused but kept for API compatibility)
+        gamma: discount factor
+        q_loss_weight: weight for Q loss term
+        device: device to run on
+        ref_model: if provided and use_lm_rewards=True, compute rewards as log P(next_token)
+        use_lm_rewards: if True, use log-probs from ref_model as rewards instead of batch rewards
+    """
     model.train()
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
-    rewards = batch["rewards"].to(device)
+
+    # Compute rewards: either from batch or from reference model log-probs
+    if use_lm_rewards and ref_model is not None:
+        with torch.no_grad():
+            ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask)
+            ref_logits = ref_outputs.logits
+            # Log-probs at each position for predicting the next token
+            log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # (B, L-1, V)
+            # Gather log prob of the actual next token
+            next_tokens = input_ids[:, 1:]  # (B, L-1)
+            rewards_lm = log_probs.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+            # Pad to full length (last position has no next token, set reward to 0)
+            rewards = torch.zeros_like(input_ids, dtype=torch.float)
+            rewards[:, :-1] = rewards_lm
+    else:
+        rewards = batch["rewards"].to(device)
 
     batch_size, seq_len = input_ids.shape
 
@@ -450,6 +480,64 @@ def plot_position_diagnostics(diag, save_path="q_diagnostics.png"):
     print(f"Saved position diagnostics plot to: {save_path}")
 
 
+def save_checkpoint(model, optimizer, step, save_dir, tokenizer=None, args=None):
+    """Save model checkpoint.
+
+    Args:
+        model: GPT2WithQ model
+        optimizer: optimizer
+        step: current training step
+        save_dir: directory to save checkpoints
+        tokenizer: optional tokenizer to save
+        args: optional training args to save
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
+
+    checkpoint = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if args is not None:
+        checkpoint["args"] = vars(args)
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Also save a "latest" symlink/copy for easy loading
+    latest_path = os.path.join(save_dir, "checkpoint_latest.pt")
+    torch.save(checkpoint, latest_path)
+
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, device="cpu"):
+    """Load a checkpoint.
+
+    Args:
+        checkpoint_path: path to checkpoint file
+        model: GPT2WithQ model to load weights into
+        optimizer: optional optimizer to load state into
+        device: device to map tensors to
+
+    Returns:
+        step: training step the checkpoint was saved at
+        args: training args if saved, else None
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    step = checkpoint.get("step", 0)
+    args = checkpoint.get("args", None)
+
+    print(f"Loaded checkpoint from step {step}")
+    return step, args
+
+
 def build_synthetic_dataset(tokenizer, num_examples=200, max_len=32):
     # Generate random short sequences from some example sentences and random rewards
     texts = [
@@ -667,6 +755,12 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="gpt2-q-head", help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    # Reward mode
+    parser.add_argument("--use_lm_rewards", action="store_true",
+                        help="Use log P(next_token) from reference model as rewards instead of batch rewards")
+    # Checkpoint saving
+    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--save_interval", type=int, default=1000, help="Save checkpoint every N steps")
     args = parser.parse_args()
 
     # Default to steps mode for streaming datasets, epochs for synthetic
@@ -693,6 +787,8 @@ def main():
                 "gamma": args.gamma,
                 "q_weight": args.q_weight,
                 "max_len": args.max_len,
+                "use_lm_rewards": args.use_lm_rewards,
+                "save_interval": args.save_interval,
             }
         )
         print(f"W&B initialized: {wandb.run.url}")
@@ -735,16 +831,26 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Reference model (standard GPT-2, no Q-head) for comparison
-    if not args.no_reference:
+    # Note: ref_model is always needed if use_lm_rewards is True
+    if not args.no_reference or args.use_lm_rewards:
         ref_model = GPT2LMHeadModel.from_pretrained("gpt2")
         ref_model.resize_token_embeddings(len(tokenizer))
         ref_model.to(args.device)
-        ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=args.lr)
-        print("Training Q-head model and reference GPT-2 in lockstep...")
+        if not args.no_reference:
+            ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=args.lr)
+            print("Training Q-head model and reference GPT-2 in lockstep...")
+        else:
+            ref_optimizer = None
+            print("Training Q-head model only (using ref model for rewards)...")
     else:
         ref_model = None
         ref_optimizer = None
         print("Training Q-head model only...")
+
+    if args.use_lm_rewards:
+        print("Using log P(next_token) from reference model as rewards")
+    else:
+        print("Using dataset rewards (zero for streaming, random for synthetic)")
 
     print(f"{'='*80}")
     print(f"{'Step':>8} | {'Q-Model PPL':>12} {'Q-Model LM':>12} {'Q-Loss':>10} | {'Ref PPL':>12} {'Ref LM':>10}")
@@ -771,12 +877,14 @@ def main():
                 batch = next(data_iter)
 
             # Train Q-head model
-            stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma, q_loss_weight=args.q_weight, device=args.device)
+            stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
+                                 q_loss_weight=args.q_weight, device=args.device,
+                                 ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
             for k, v in stats_q.items():
                 acc_q[k] += v
 
-            # Train reference model on same batch
-            if ref_model is not None:
+            # Train reference model on same batch (only if we're actually training it)
+            if ref_optimizer is not None:
                 stats_ref = train_step_reference(ref_model, batch, ref_optimizer, device=args.device)
                 for k, v in stats_ref.items():
                     acc_ref[k] += v
@@ -784,6 +892,10 @@ def main():
             global_step += 1
             interval_count += 1
             pbar.update(1)
+
+            # Save checkpoint at regular intervals
+            if global_step % args.save_interval == 0:
+                save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
 
             # Log diagnostics every N steps
             if global_step % args.log_interval == 0:
@@ -799,7 +911,7 @@ def main():
                         "q_model/lm_loss": q_lm,
                         "q_model/q_loss": q_loss,
                     }
-                    if ref_model is not None:
+                    if ref_optimizer is not None:
                         ref_ppl = acc_ref["perplexity"] / interval_count
                         ref_lm = acc_ref["lm_loss"] / interval_count
                         log_dict["ref_model/perplexity"] = ref_ppl
@@ -807,7 +919,7 @@ def main():
                         log_dict["delta_ppl"] = q_ppl - ref_ppl
                     wandb.log(log_dict, step=global_step)
 
-                if ref_model is not None:
+                if ref_optimizer is not None:
                     ref_ppl = acc_ref["perplexity"] / interval_count
                     ref_lm = acc_ref["lm_loss"] / interval_count
                     ppl_diff = q_ppl - ref_ppl
@@ -829,13 +941,15 @@ def main():
 
             for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
                 # Train Q-head model
-                stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma, q_loss_weight=args.q_weight, device=args.device)
+                stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
+                                     q_loss_weight=args.q_weight, device=args.device,
+                                     ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
                 for k, v in stats_q.items():
                     epoch_q[k] += v
                     acc_q[k] += v
 
-                # Train reference model on same batch
-                if ref_model is not None:
+                # Train reference model on same batch (only if we're actually training it)
+                if ref_optimizer is not None:
                     stats_ref = train_step_reference(ref_model, batch, ref_optimizer, device=args.device)
                     for k, v in stats_ref.items():
                         epoch_ref[k] += v
@@ -844,6 +958,10 @@ def main():
                 global_step += 1
                 epoch_count += 1
                 interval_count += 1
+
+                # Save checkpoint at regular intervals
+                if global_step % args.save_interval == 0:
+                    save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
 
                 # Log diagnostics every N batches
                 if global_step % args.log_interval == 0:
@@ -860,7 +978,7 @@ def main():
                             "q_model/lm_loss": q_lm,
                             "q_model/q_loss": q_loss,
                         }
-                        if ref_model is not None:
+                        if ref_optimizer is not None:
                             ref_ppl = acc_ref["perplexity"] / interval_count
                             ref_lm = acc_ref["lm_loss"] / interval_count
                             log_dict["ref_model/perplexity"] = ref_ppl
@@ -868,7 +986,7 @@ def main():
                             log_dict["delta_ppl"] = q_ppl - ref_ppl
                         wandb.log(log_dict, step=global_step)
 
-                    if ref_model is not None:
+                    if ref_optimizer is not None:
                         ref_ppl = acc_ref["perplexity"] / interval_count
                         ref_lm = acc_ref["lm_loss"] / interval_count
                         ppl_diff = q_ppl - ref_ppl
@@ -884,7 +1002,7 @@ def main():
             q_ppl = epoch_q["perplexity"] / epoch_count
             q_lm = epoch_q["lm_loss"] / epoch_count
             q_loss = epoch_q["q_loss"] / epoch_count
-            if ref_model is not None:
+            if ref_optimizer is not None:
                 ref_ppl = epoch_ref["perplexity"] / epoch_count
                 ref_lm = epoch_ref["lm_loss"] / epoch_count
                 ppl_diff = q_ppl - ref_ppl
@@ -895,6 +1013,10 @@ def main():
             else:
                 print(f"Epoch {epoch+1}: PPL={q_ppl:.2f}, LM Loss={q_lm:.4f}, Q Loss={q_loss:.4f}")
             print(f"{'='*80}")
+
+    # Save final checkpoint
+    save_checkpoint(model, optimizer, global_step, args.save_dir, args=args)
+    print(f"\nTraining complete. Final checkpoint saved at step {global_step}")
 
     # Generate position-wise diagnostics at end of training
     if args.plot_diagnostics or True:  # Always compute, optionally plot
