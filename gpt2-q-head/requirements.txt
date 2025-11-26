@@ -3,3 +3,4 @@ transformers>=4.40.0
 tqdm
 datasets
 sentencepiece
+matplotlib  # optional, for --plot_diagnostics
