@@ -4,3 +4,4 @@ tqdm
 datasets
 sentencepiece
 matplotlib  # optional, for --plot_diagnostics
+wandb  # optional, for --wandb logging

@@ -6,6 +6,7 @@ from itertools import islice
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 from datasets import load_dataset
@@ -16,8 +17,130 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 from model import GPT2WithQ
 from dataset import TokenRewardDataset, collate_fn
+
+
+# =============================================================================
+# Q-Tilted Sampling for Inference
+# =============================================================================
+
+def sample_with_q_tilt(model, input_ids, beta=1.0, temperature=1.0, top_k=None, top_p=None):
+    """Sample next token using Q-tilted distribution.
+
+    The tilted distribution is derived from KL-constrained optimization:
+        max_π' E_a~π'[Q(s,a)] - β·KL(π'||π)
+
+    This has closed-form solution:
+        π'(a|s) ∝ π(a|s) · exp(Q(s,a)/β)
+
+    In logit space:
+        logits' = logits + Q/β
+
+    Args:
+        model: GPT2WithQ model
+        input_ids: tensor (B, L) of input token ids
+        beta: KL penalty weight. Higher β = closer to original policy.
+              Lower β = more Q-seeking. β→∞ recovers π, β→0 picks argmax Q.
+        temperature: softmax temperature for final sampling
+        top_k: if set, restrict to top-k tokens before sampling
+        top_p: if set, use nucleus sampling with this threshold
+
+    Returns:
+        next_token: tensor (B,) of sampled token ids
+        info: dict with logits, q_values, tilted_logits for analysis
+    """
+    model.eval()
+    with torch.no_grad():
+        logits, q_values = model(input_ids)
+
+        # Get logits and Q-values for the last position
+        last_logits = logits[:, -1, :]  # (B, V)
+        last_q = q_values[:, -1, :]  # (B, V)
+
+        # Q-tilted logits: logits' = logits + Q/β
+        # When β is large, we stay close to the LM policy
+        # When β is small, we weight heavily toward high-Q actions
+        tilted_logits = last_logits + last_q / beta
+
+        # Apply temperature
+        tilted_logits = tilted_logits / temperature
+
+        # Optional: top-k filtering
+        if top_k is not None:
+            top_k = min(top_k, tilted_logits.size(-1))
+            indices_to_remove = tilted_logits < torch.topk(tilted_logits, top_k)[0][..., -1, None]
+            tilted_logits[indices_to_remove] = float('-inf')
+
+        # Optional: nucleus (top-p) sampling
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(tilted_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            tilted_logits[indices_to_remove] = float('-inf')
+
+        # Sample from tilted distribution
+        probs = F.softmax(tilted_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        info = {
+            "logits": last_logits,
+            "q_values": last_q,
+            "tilted_logits": tilted_logits,
+            "probs": probs,
+        }
+
+    model.train()
+    return next_token, info
+
+
+def generate_with_q_tilt(model, tokenizer, prompt, max_new_tokens=50, beta=1.0,
+                         temperature=1.0, top_k=None, top_p=None, device="cpu"):
+    """Generate text using Q-tilted sampling.
+
+    Args:
+        model: GPT2WithQ model
+        tokenizer: tokenizer
+        prompt: string prompt to continue
+        max_new_tokens: number of tokens to generate
+        beta: KL penalty (higher = more like base LM, lower = more Q-seeking)
+        temperature: sampling temperature
+        top_k: top-k filtering
+        top_p: nucleus sampling threshold
+        device: device to run on
+
+    Returns:
+        generated_text: the full generated string
+        tokens: list of generated token ids
+    """
+    model.eval()
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    generated_tokens = []
+    for _ in range(max_new_tokens):
+        next_token, _ = sample_with_q_tilt(
+            model, input_ids, beta=beta, temperature=temperature,
+            top_k=top_k, top_p=top_p
+        )
+        generated_tokens.append(next_token.item())
+        input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
+
+        # Stop at EOS
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+
+    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    model.train()
+    return generated_text, generated_tokens
 
 
 def estimate_batch_size(device, seq_len=48, model_name="gpt2", safety_factor=0.7):
@@ -540,6 +663,10 @@ def main():
     parser.add_argument("--dataset", type=str, default="synthetic",
                         choices=["synthetic", "wikipedia", "openwebtext", "c4", "pile"],
                         help="Dataset to use for training")
+    # Weights & Biases
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="gpt2-q-head", help="W&B project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
     args = parser.parse_args()
 
     # Default to steps mode for streaming datasets, epochs for synthetic
@@ -549,6 +676,27 @@ def main():
         else:
             args.steps = 10000  # Default 10k steps for streaming
 
+    # Initialize Weights & Biases
+    use_wandb = args.wandb and HAS_WANDB
+    if args.wandb and not HAS_WANDB:
+        print("Warning: --wandb specified but wandb not installed. Run: pip install wandb")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "dataset": args.dataset,
+                "steps": args.steps,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "gamma": args.gamma,
+                "q_weight": args.q_weight,
+                "max_len": args.max_len,
+            }
+        )
+        print(f"W&B initialized: {wandb.run.url}")
+
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     # ensure padding token exists
     if tokenizer.pad_token is None:
@@ -557,6 +705,8 @@ def main():
     # Auto-scale batch size based on GPU memory if not specified
     if args.batch_size is None:
         args.batch_size = estimate_batch_size(args.device, seq_len=args.max_len)
+        if use_wandb:
+            wandb.config.update({"batch_size": args.batch_size})
     else:
         print(f"Using specified batch size: {args.batch_size}")
 
@@ -640,6 +790,23 @@ def main():
                 q_ppl = acc_q["perplexity"] / interval_count
                 q_lm = acc_q["lm_loss"] / interval_count
                 q_loss = acc_q["q_loss"] / interval_count
+
+                # W&B logging
+                if use_wandb:
+                    log_dict = {
+                        "step": global_step,
+                        "q_model/perplexity": q_ppl,
+                        "q_model/lm_loss": q_lm,
+                        "q_model/q_loss": q_loss,
+                    }
+                    if ref_model is not None:
+                        ref_ppl = acc_ref["perplexity"] / interval_count
+                        ref_lm = acc_ref["lm_loss"] / interval_count
+                        log_dict["ref_model/perplexity"] = ref_ppl
+                        log_dict["ref_model/lm_loss"] = ref_lm
+                        log_dict["delta_ppl"] = q_ppl - ref_ppl
+                    wandb.log(log_dict, step=global_step)
+
                 if ref_model is not None:
                     ref_ppl = acc_ref["perplexity"] / interval_count
                     ref_lm = acc_ref["lm_loss"] / interval_count
@@ -683,6 +850,24 @@ def main():
                     q_ppl = acc_q["perplexity"] / interval_count
                     q_lm = acc_q["lm_loss"] / interval_count
                     q_loss = acc_q["q_loss"] / interval_count
+
+                    # W&B logging
+                    if use_wandb:
+                        log_dict = {
+                            "step": global_step,
+                            "epoch": epoch + 1,
+                            "q_model/perplexity": q_ppl,
+                            "q_model/lm_loss": q_lm,
+                            "q_model/q_loss": q_loss,
+                        }
+                        if ref_model is not None:
+                            ref_ppl = acc_ref["perplexity"] / interval_count
+                            ref_lm = acc_ref["lm_loss"] / interval_count
+                            log_dict["ref_model/perplexity"] = ref_ppl
+                            log_dict["ref_model/lm_loss"] = ref_lm
+                            log_dict["delta_ppl"] = q_ppl - ref_ppl
+                        wandb.log(log_dict, step=global_step)
+
                     if ref_model is not None:
                         ref_ppl = acc_ref["perplexity"] / interval_count
                         ref_lm = acc_ref["lm_loss"] / interval_count
@@ -731,6 +916,12 @@ def main():
 
         if args.plot_diagnostics:
             plot_position_diagnostics(diag, save_path=args.plot_path)
+            if use_wandb:
+                wandb.log({"diagnostics_plot": wandb.Image(args.plot_path)})
+
+    # Finish W&B run
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
