@@ -5,6 +5,7 @@ import argparse
 from tqdm import tqdm
 from itertools import islice
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -304,11 +305,174 @@ def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0
     # Perplexity = exp(cross-entropy loss)
     perplexity = math.exp(lm_loss.item()) if lm_loss.item() < 100 else float('inf')
 
+    # Compute comprehensive metrics for monitoring
+    with torch.no_grad():
+        pos_mask_sum = mask.sum(dim=0)  # (L-1,) - count of valid samples at each position
+
+        # === Position-wise Q loss ===
+        q_loss_by_pos = (q_loss_per_pos.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise returns variance ===
+        masked_returns = returns_target * mask
+        returns_mean_by_pos = masked_returns.sum(dim=0) / (pos_mask_sum + 1e-8)  # (L-1,)
+        returns_sq_diff = ((returns_target - returns_mean_by_pos.unsqueeze(0)) ** 2) * mask
+        returns_var_by_pos = (returns_sq_diff.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise mean Q predictions ===
+        masked_q_pred = q_pred * mask
+        q_pred_mean_by_pos = (masked_q_pred.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise Q prediction variance ===
+        q_pred_mean_expanded = (masked_q_pred.sum(dim=0) / (pos_mask_sum + 1e-8)).unsqueeze(0)
+        q_pred_sq_diff = ((q_pred - q_pred_mean_expanded) ** 2) * mask
+        q_pred_var_by_pos = (q_pred_sq_diff.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise mean target returns ===
+        returns_mean_by_pos_np = returns_mean_by_pos.cpu().numpy()  # (L-1,)
+
+        # === Position-wise LM loss (cross-entropy at each position) ===
+        lm_loss_per_pos = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels_masked.view(-1),
+            reduction='none',
+            ignore_index=-100
+        ).view(batch_size, -1)  # (B, L-1)
+        lm_loss_by_pos = (lm_loss_per_pos.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise LM entropy (uncertainty in predictions) ===
+        lm_probs = F.softmax(shift_logits, dim=-1)  # (B, L-1, V)
+        lm_log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, L-1, V)
+        lm_entropy = -(lm_probs * lm_log_probs).sum(dim=-1)  # (B, L-1)
+        lm_entropy_by_pos = ((lm_entropy * mask).sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise top-1 accuracy ===
+        top1_correct = (shift_logits.argmax(dim=-1) == shift_labels).float() * mask  # (B, L-1)
+        top1_acc_by_pos = (top1_correct.sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()  # (L-1,)
+
+        # === Position-wise Q entropy (uncertainty in Q-tilted policy) ===
+        # Q-tilted logits: logits + Q (with beta=1)
+        tilted_logits = shift_logits + shift_q  # (B, L-1, V)
+        tilted_probs = F.softmax(tilted_logits, dim=-1)
+        tilted_log_probs = F.log_softmax(tilted_logits, dim=-1)
+        tilted_entropy = -(tilted_probs * tilted_log_probs).sum(dim=-1)  # (B, L-1)
+        tilted_entropy_by_pos = ((tilted_entropy * mask).sum(dim=0) / (pos_mask_sum + 1e-8)).cpu().numpy()
+
+        # === Global Q statistics ===
+        valid_q_pred = q_pred[mask > 0]
+        q_pred_global_mean = valid_q_pred.mean().item() if valid_q_pred.numel() > 0 else 0.0
+        q_pred_global_std = valid_q_pred.std().item() if valid_q_pred.numel() > 1 else 0.0
+        q_pred_global_min = valid_q_pred.min().item() if valid_q_pred.numel() > 0 else 0.0
+        q_pred_global_max = valid_q_pred.max().item() if valid_q_pred.numel() > 0 else 0.0
+
+        # === Global returns statistics ===
+        valid_returns = returns_target[mask > 0]
+        returns_global_mean = valid_returns.mean().item() if valid_returns.numel() > 0 else 0.0
+        returns_global_std = valid_returns.std().item() if valid_returns.numel() > 1 else 0.0
+        returns_global_min = valid_returns.min().item() if valid_returns.numel() > 0 else 0.0
+        returns_global_max = valid_returns.max().item() if valid_returns.numel() > 0 else 0.0
+
+        # === Bootstrap value statistics ===
+        bootstrap_mean = bootstrap_values.mean().item()
+        bootstrap_std = bootstrap_values.std().item() if bootstrap_values.numel() > 1 else 0.0
+
+        # === Reward statistics ===
+        valid_rewards = rewards[attention_mask > 0]
+        rewards_mean = valid_rewards.mean().item() if valid_rewards.numel() > 0 else 0.0
+        rewards_std = valid_rewards.std().item() if valid_rewards.numel() > 1 else 0.0
+        rewards_nonzero_frac = (valid_rewards.abs() > 1e-8).float().mean().item() if valid_rewards.numel() > 0 else 0.0
+
+        # === Q-value distribution for taken vs not-taken actions ===
+        # Q for taken action is q_pred, Q for all actions is shift_q
+        # Compute mean Q over all actions efficiently without expanding mask
+        # Mean over vocab dimension first, then masked mean over positions
+        q_all_per_pos = shift_q.mean(dim=-1)  # (B, L-1)
+        q_all_mean = ((q_all_per_pos * mask).sum() / (mask.sum() + 1e-8)).item()
+        q_taken_advantage = (q_pred_global_mean - q_all_mean) if valid_q_pred.numel() > 0 else 0.0
+
+        # === Policy statistics ===
+        policy_probs_all = F.softmax(shift_logits, dim=-1)  # (B, L-1, V)
+        # Probability assigned to taken action
+        taken_probs = policy_probs_all.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+        valid_taken_probs = taken_probs[mask > 0]
+        taken_prob_mean = valid_taken_probs.mean().item() if valid_taken_probs.numel() > 0 else 0.0
+        taken_log_prob_mean = valid_taken_probs.log().mean().item() if valid_taken_probs.numel() > 0 else 0.0
+
+        # === KL divergence between LM policy and Q-tilted policy ===
+        kl_div = (lm_probs * (lm_log_probs - tilted_log_probs)).sum(dim=-1)  # (B, L-1)
+        kl_div_mean = ((kl_div * mask).sum() / (mask.sum() + 1e-8)).item()
+
+        # === Gradient norms (computed after backward) ===
+        total_grad_norm = 0.0
+        q_head_grad_norm = 0.0
+        lm_head_grad_norm = 0.0
+        transformer_grad_norm = 0.0
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2).item() ** 2
+                total_grad_norm += param_norm
+                if 'q_head' in name:
+                    q_head_grad_norm += param_norm
+                elif 'lm_head' in name:
+                    lm_head_grad_norm += param_norm
+                else:
+                    transformer_grad_norm += param_norm
+        total_grad_norm = total_grad_norm ** 0.5
+        q_head_grad_norm = q_head_grad_norm ** 0.5
+        lm_head_grad_norm = lm_head_grad_norm ** 0.5
+        transformer_grad_norm = transformer_grad_norm ** 0.5
+
     return {
+        # Basic losses
         "loss": loss.item(),
         "lm_loss": lm_loss.item(),
         "q_loss": q_loss.item(),
         "perplexity": perplexity,
+
+        # Position-wise arrays (numpy)
+        "q_loss_by_pos": q_loss_by_pos,
+        "returns_var_by_pos": returns_var_by_pos,
+        "q_pred_mean_by_pos": q_pred_mean_by_pos,
+        "q_pred_var_by_pos": q_pred_var_by_pos,
+        "returns_mean_by_pos": returns_mean_by_pos_np,
+        "lm_loss_by_pos": lm_loss_by_pos,
+        "lm_entropy_by_pos": lm_entropy_by_pos,
+        "top1_acc_by_pos": top1_acc_by_pos,
+        "tilted_entropy_by_pos": tilted_entropy_by_pos,
+
+        # Global Q statistics
+        "q_pred_global_mean": q_pred_global_mean,
+        "q_pred_global_std": q_pred_global_std,
+        "q_pred_global_min": q_pred_global_min,
+        "q_pred_global_max": q_pred_global_max,
+
+        # Global returns statistics
+        "returns_global_mean": returns_global_mean,
+        "returns_global_std": returns_global_std,
+        "returns_global_min": returns_global_min,
+        "returns_global_max": returns_global_max,
+
+        # Bootstrap statistics
+        "bootstrap_mean": bootstrap_mean,
+        "bootstrap_std": bootstrap_std,
+
+        # Reward statistics
+        "rewards_mean": rewards_mean,
+        "rewards_std": rewards_std,
+        "rewards_nonzero_frac": rewards_nonzero_frac,
+
+        # Q advantage (taken action Q vs average Q)
+        "q_taken_advantage": q_taken_advantage,
+
+        # Policy statistics
+        "taken_prob_mean": taken_prob_mean,
+        "taken_log_prob_mean": taken_log_prob_mean,
+        "kl_div_lm_tilted": kl_div_mean,
+
+        # Gradient norms
+        "grad_norm_total": total_grad_norm,
+        "grad_norm_q_head": q_head_grad_norm,
+        "grad_norm_lm_head": lm_head_grad_norm,
+        "grad_norm_transformer": transformer_grad_norm,
     }
 
 
@@ -575,7 +739,8 @@ class StreamingTextDataset(IterableDataset):
     """
 
     def __init__(self, dataset_name, config_name, tokenizer, block_size=128,
-                 text_field="text", reward_mode="zero", split="train"):
+                 text_field="text", reward_mode="zero", split="train",
+                 shuffle_buffer_size=10000, seed=None):
         self.dataset_name = dataset_name
         self.config_name = config_name
         self.tokenizer = tokenizer
@@ -583,6 +748,8 @@ class StreamingTextDataset(IterableDataset):
         self.text_field = text_field
         self.reward_mode = reward_mode
         self.split = split
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.seed = seed
 
     def __iter__(self):
         # Load dataset in streaming mode
@@ -593,6 +760,10 @@ class StreamingTextDataset(IterableDataset):
             streaming=True,
             trust_remote_code=True
         )
+
+        # Shuffle the dataset using a buffer - this shuffles documents before tokenization
+        if self.shuffle_buffer_size > 0:
+            ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
 
         token_buffer = []
 
@@ -616,7 +787,8 @@ class StreamingTextDataset(IterableDataset):
                 yield {"input_ids": block, "rewards": rewards}
 
 
-def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, split="train"):
+def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, split="train",
+                            shuffle_buffer_size=10000, seed=None):
     """Build a streaming dataset for continuous training.
 
     Args:
@@ -628,6 +800,8 @@ def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, spli
             - "c4": allenai/c4
         block_size: tokens per example
         split: dataset split
+        shuffle_buffer_size: Size of buffer for shuffling documents (0 to disable)
+        seed: Random seed for reproducible shuffling
 
     Returns:
         StreamingTextDataset instance
@@ -644,7 +818,8 @@ def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, spli
 
     ds_name, config, text_field = dataset_configs[dataset]
 
-    print(f"Loading streaming dataset: {ds_name}" + (f" ({config})" if config else ""))
+    shuffle_str = f", shuffle_buffer={shuffle_buffer_size}" if shuffle_buffer_size > 0 else ""
+    print(f"Loading streaming dataset: {ds_name}" + (f" ({config})" if config else "") + shuffle_str)
 
     return StreamingTextDataset(
         dataset_name=ds_name,
@@ -652,7 +827,9 @@ def build_streaming_dataset(tokenizer, dataset="wikipedia", block_size=128, spli
         tokenizer=tokenizer,
         block_size=block_size,
         text_field=text_field,
-        split=split
+        split=split,
+        shuffle_buffer_size=shuffle_buffer_size,
+        seed=seed
     )
 
 
@@ -761,6 +938,7 @@ def main():
     # Checkpoint saving
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save_interval", type=int, default=1000, help="Save checkpoint every N steps")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g., checkpoints/checkpoint_latest.pt)")
     args = parser.parse_args()
 
     # Default to steps mode for streaming datasets, epochs for synthetic
@@ -830,6 +1008,15 @@ def main():
     model.to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Resume from checkpoint if specified
+    resume_step = 0
+    if args.resume:
+        if os.path.exists(args.resume):
+            resume_step, loaded_args = load_checkpoint(args.resume, model, optimizer, device=args.device)
+            print(f"Resuming from step {resume_step}")
+        else:
+            print(f"Warning: Checkpoint not found at {args.resume}, starting from scratch")
+
     # Reference model (standard GPT-2, no Q-head) for comparison
     # Note: ref_model is always needed if use_lm_rewards is True
     if not args.no_reference or args.use_lm_rewards:
@@ -857,16 +1044,24 @@ def main():
     print(f"{'='*80}")
 
     # Unified training loop for both streaming and epoch-based modes
-    global_step = 0
-    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+    global_step = resume_step
+    acc_q = {}  # Will accumulate all scalar metrics
     acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+
+    # Position-wise array keys (these need separate accumulation)
+    POSITION_WISE_KEYS = {
+        "q_loss_by_pos", "returns_var_by_pos", "q_pred_mean_by_pos", "q_pred_var_by_pos",
+        "returns_mean_by_pos", "lm_loss_by_pos", "lm_entropy_by_pos", "top1_acc_by_pos",
+        "tilted_entropy_by_pos"
+    }
+    acc_pos_arrays = {}  # Will accumulate position-wise arrays
     interval_count = 0
 
     if streaming or args.steps is not None:
         # Step-based training (streaming mode)
         total_steps = args.steps or 10000
         data_iter = iter(dataloader)
-        pbar = tqdm(total=total_steps, desc="Training")
+        pbar = tqdm(total=total_steps, initial=resume_step, desc="Training")
 
         while global_step < total_steps:
             try:
@@ -880,8 +1075,21 @@ def main():
             stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
                                  q_loss_weight=args.q_weight, device=args.device,
                                  ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
+
+            # Accumulate scalar metrics
             for k, v in stats_q.items():
-                acc_q[k] += v
+                if k not in POSITION_WISE_KEYS:
+                    if k not in acc_q:
+                        acc_q[k] = 0.0
+                    acc_q[k] += v
+
+            # Accumulate position-wise arrays
+            for k in POSITION_WISE_KEYS:
+                arr = stats_q.get(k)
+                if arr is not None:
+                    if k not in acc_pos_arrays:
+                        acc_pos_arrays[k] = np.zeros_like(arr)
+                    acc_pos_arrays[k] += arr
 
             # Train reference model on same batch (only if we're actually training it)
             if ref_optimizer is not None:
@@ -899,9 +1107,9 @@ def main():
 
             # Log diagnostics every N steps
             if global_step % args.log_interval == 0:
-                q_ppl = acc_q["perplexity"] / interval_count
-                q_lm = acc_q["lm_loss"] / interval_count
-                q_loss = acc_q["q_loss"] / interval_count
+                q_ppl = acc_q.get("perplexity", 0.0) / interval_count
+                q_lm = acc_q.get("lm_loss", 0.0) / interval_count
+                q_loss = acc_q.get("q_loss", 0.0) / interval_count
 
                 # W&B logging
                 if use_wandb:
@@ -917,6 +1125,60 @@ def main():
                         log_dict["ref_model/perplexity"] = ref_ppl
                         log_dict["ref_model/lm_loss"] = ref_lm
                         log_dict["delta_ppl"] = q_ppl - ref_ppl
+
+                    # === Global scalar metrics ===
+                    scalar_metrics = [
+                        # Global Q statistics
+                        ("q_stats/global_mean", "q_pred_global_mean"),
+                        ("q_stats/global_std", "q_pred_global_std"),
+                        ("q_stats/global_min", "q_pred_global_min"),
+                        ("q_stats/global_max", "q_pred_global_max"),
+                        # Global returns statistics
+                        ("returns_stats/global_mean", "returns_global_mean"),
+                        ("returns_stats/global_std", "returns_global_std"),
+                        ("returns_stats/global_min", "returns_global_min"),
+                        ("returns_stats/global_max", "returns_global_max"),
+                        # Bootstrap statistics
+                        ("bootstrap/mean", "bootstrap_mean"),
+                        ("bootstrap/std", "bootstrap_std"),
+                        # Reward statistics
+                        ("rewards/mean", "rewards_mean"),
+                        ("rewards/std", "rewards_std"),
+                        ("rewards/nonzero_frac", "rewards_nonzero_frac"),
+                        # Q advantage
+                        ("q_stats/taken_advantage", "q_taken_advantage"),
+                        # Policy statistics
+                        ("policy/taken_prob_mean", "taken_prob_mean"),
+                        ("policy/taken_log_prob_mean", "taken_log_prob_mean"),
+                        ("policy/kl_div_lm_tilted", "kl_div_lm_tilted"),
+                        # Gradient norms
+                        ("gradients/total_norm", "grad_norm_total"),
+                        ("gradients/q_head_norm", "grad_norm_q_head"),
+                        ("gradients/lm_head_norm", "grad_norm_lm_head"),
+                        ("gradients/transformer_norm", "grad_norm_transformer"),
+                    ]
+                    for log_key, acc_key in scalar_metrics:
+                        if acc_key in acc_q:
+                            log_dict[log_key] = acc_q[acc_key] / interval_count
+
+                    # === Position-wise array logging ===
+                    key_positions = [0, 5, 10, 20, 30, 50, 80, 100, 120]
+
+                    for arr_name in POSITION_WISE_KEYS:
+                        if arr_name in acc_pos_arrays:
+                            avg_arr = acc_pos_arrays[arr_name] / interval_count
+                            # Log key individual positions
+                            for pos in key_positions:
+                                if pos < len(avg_arr):
+                                    log_dict[f"{arr_name}/pos_{pos:03d}"] = avg_arr[pos]
+                            # Log range means
+                            if len(avg_arr) >= 30:
+                                log_dict[f"{arr_name}/mean_early_0_30"] = avg_arr[:30].mean()
+                            if len(avg_arr) >= 90:
+                                log_dict[f"{arr_name}/mean_mid_30_90"] = avg_arr[30:90].mean()
+                            if len(avg_arr) > 90:
+                                log_dict[f"{arr_name}/mean_late_90_end"] = avg_arr[90:].mean()
+
                     wandb.log(log_dict, step=global_step)
 
                 if ref_optimizer is not None:
@@ -927,15 +1189,16 @@ def main():
                 else:
                     tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
                 # Reset interval accumulators
-                acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                acc_q = {}
                 acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                acc_pos_arrays = {}
                 interval_count = 0
 
         pbar.close()
     else:
         # Epoch-based training (finite dataset)
         for epoch in range(args.epochs):
-            epoch_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+            epoch_q = {}
             epoch_ref = {"lm_loss": 0.0, "perplexity": 0.0}
             epoch_count = 0
 
@@ -944,9 +1207,24 @@ def main():
                 stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
                                      q_loss_weight=args.q_weight, device=args.device,
                                      ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
+
+                # Accumulate scalar metrics
                 for k, v in stats_q.items():
-                    epoch_q[k] += v
-                    acc_q[k] += v
+                    if k not in POSITION_WISE_KEYS:
+                        if k not in epoch_q:
+                            epoch_q[k] = 0.0
+                        epoch_q[k] += v
+                        if k not in acc_q:
+                            acc_q[k] = 0.0
+                        acc_q[k] += v
+
+                # Accumulate position-wise arrays
+                for k in POSITION_WISE_KEYS:
+                    arr = stats_q.get(k)
+                    if arr is not None:
+                        if k not in acc_pos_arrays:
+                            acc_pos_arrays[k] = np.zeros_like(arr)
+                        acc_pos_arrays[k] += arr
 
                 # Train reference model on same batch (only if we're actually training it)
                 if ref_optimizer is not None:
@@ -965,9 +1243,9 @@ def main():
 
                 # Log diagnostics every N batches
                 if global_step % args.log_interval == 0:
-                    q_ppl = acc_q["perplexity"] / interval_count
-                    q_lm = acc_q["lm_loss"] / interval_count
-                    q_loss = acc_q["q_loss"] / interval_count
+                    q_ppl = acc_q.get("perplexity", 0.0) / interval_count
+                    q_lm = acc_q.get("lm_loss", 0.0) / interval_count
+                    q_loss = acc_q.get("q_loss", 0.0) / interval_count
 
                     # W&B logging
                     if use_wandb:
@@ -984,6 +1262,51 @@ def main():
                             log_dict["ref_model/perplexity"] = ref_ppl
                             log_dict["ref_model/lm_loss"] = ref_lm
                             log_dict["delta_ppl"] = q_ppl - ref_ppl
+
+                        # === Global scalar metrics ===
+                        scalar_metrics = [
+                            ("q_stats/global_mean", "q_pred_global_mean"),
+                            ("q_stats/global_std", "q_pred_global_std"),
+                            ("q_stats/global_min", "q_pred_global_min"),
+                            ("q_stats/global_max", "q_pred_global_max"),
+                            ("returns_stats/global_mean", "returns_global_mean"),
+                            ("returns_stats/global_std", "returns_global_std"),
+                            ("returns_stats/global_min", "returns_global_min"),
+                            ("returns_stats/global_max", "returns_global_max"),
+                            ("bootstrap/mean", "bootstrap_mean"),
+                            ("bootstrap/std", "bootstrap_std"),
+                            ("rewards/mean", "rewards_mean"),
+                            ("rewards/std", "rewards_std"),
+                            ("rewards/nonzero_frac", "rewards_nonzero_frac"),
+                            ("q_stats/taken_advantage", "q_taken_advantage"),
+                            ("policy/taken_prob_mean", "taken_prob_mean"),
+                            ("policy/taken_log_prob_mean", "taken_log_prob_mean"),
+                            ("policy/kl_div_lm_tilted", "kl_div_lm_tilted"),
+                            ("gradients/total_norm", "grad_norm_total"),
+                            ("gradients/q_head_norm", "grad_norm_q_head"),
+                            ("gradients/lm_head_norm", "grad_norm_lm_head"),
+                            ("gradients/transformer_norm", "grad_norm_transformer"),
+                        ]
+                        for log_key, acc_key in scalar_metrics:
+                            if acc_key in acc_q:
+                                log_dict[log_key] = acc_q[acc_key] / interval_count
+
+                        # === Position-wise array logging ===
+                        key_positions = [0, 5, 10, 20, 30, 50, 80, 100, 120]
+
+                        for arr_name in POSITION_WISE_KEYS:
+                            if arr_name in acc_pos_arrays:
+                                avg_arr = acc_pos_arrays[arr_name] / interval_count
+                                for pos in key_positions:
+                                    if pos < len(avg_arr):
+                                        log_dict[f"{arr_name}/pos_{pos:03d}"] = avg_arr[pos]
+                                if len(avg_arr) >= 30:
+                                    log_dict[f"{arr_name}/mean_early_0_30"] = avg_arr[:30].mean()
+                                if len(avg_arr) >= 90:
+                                    log_dict[f"{arr_name}/mean_mid_30_90"] = avg_arr[30:90].mean()
+                                if len(avg_arr) > 90:
+                                    log_dict[f"{arr_name}/mean_late_90_end"] = avg_arr[90:].mean()
+
                         wandb.log(log_dict, step=global_step)
 
                     if ref_optimizer is not None:
@@ -993,15 +1316,16 @@ def main():
                         tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} | {ref_ppl:>12.2f} {ref_lm:>10.4f}  (Δppl={ppl_diff:+.2f})")
                     else:
                         tqdm.write(f"{global_step:>8} | {q_ppl:>12.2f} {q_lm:>12.4f} {q_loss:>10.4f} |")
-                    acc_q = {"loss": 0.0, "lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+                    acc_q = {}
                     acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
+                    acc_pos_arrays = {}
                     interval_count = 0
 
             # Epoch summary
             print(f"{'-'*80}")
-            q_ppl = epoch_q["perplexity"] / epoch_count
-            q_lm = epoch_q["lm_loss"] / epoch_count
-            q_loss = epoch_q["q_loss"] / epoch_count
+            q_ppl = epoch_q.get("perplexity", 0.0) / epoch_count
+            q_lm = epoch_q.get("lm_loss", 0.0) / epoch_count
+            q_loss = epoch_q.get("q_loss", 0.0) / epoch_count
             if ref_optimizer is not None:
                 ref_ppl = epoch_ref["perplexity"] / epoch_count
                 ref_lm = epoch_ref["lm_loss"] / epoch_count
