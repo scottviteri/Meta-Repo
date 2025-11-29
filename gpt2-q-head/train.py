@@ -210,8 +210,67 @@ def compute_discounted_returns_batch(rewards, gamma: float, bootstrap_values=Non
     return returns
 
 
+def compute_gae_returns_batch(rewards, values, gamma: float, gae_lambda: float, bootstrap_values=None):
+    """Compute GAE (Generalized Advantage Estimation) λ-returns.
+
+    The λ-return is a weighted combination of n-step returns:
+        G_t^λ = (1-λ) Σ_{n=1}^{T-t-1} λ^{n-1} G_t^{(n)} + λ^{T-t-1} G_t^{(T-t)}
+
+    where G_t^{(n)} = r_t + γr_{t+1} + ... + γ^{n-1}r_{t+n-1} + γ^n V(s_{t+n})
+
+    Equivalently, using the recursive GAE formulation:
+        δ_t = r_t + γV(s_{t+1}) - V(s_t)  (TD error)
+        A_t^GAE = Σ_{k=0}^{T-t-1} (γλ)^k δ_{t+k}
+        G_t^λ = A_t^GAE + V(s_t)
+
+    Args:
+        rewards: tensor (B, L) - rewards at each position
+        values: tensor (B, L) - value estimates V(s_t) at each position
+        gamma: discount factor
+        gae_lambda: GAE λ parameter (0 = TD(0), 1 = Monte Carlo)
+        bootstrap_values: tensor (B,) - V(s_L) beyond context. If None, assumes 0.
+
+    Returns:
+        gae_returns: tensor (B, L) - GAE λ-return targets for each position
+    """
+    B, L = rewards.shape
+    device = rewards.device
+
+    # Append bootstrap values for V(s_L)
+    if bootstrap_values is not None:
+        values_extended = torch.cat([values, bootstrap_values.unsqueeze(1)], dim=1)  # (B, L+1)
+    else:
+        values_extended = torch.cat([values, torch.zeros(B, 1, device=device)], dim=1)
+
+    # Compute TD errors: δ_t = r_t + γV(s_{t+1}) - V(s_t)
+    # Note: For Q-learning targets, we want returns from position t+1 onward
+    # So δ_t = r_{t+1} + γV(s_{t+2}) - V(s_{t+1}) for the return target at position t
+    td_errors = torch.zeros(B, L, device=device)
+    for t in range(L - 1):
+        # Return at position t is based on rewards from t+1 onward
+        td_errors[:, t] = rewards[:, t + 1] + gamma * values_extended[:, t + 2] - values_extended[:, t + 1]
+    # Last position: only bootstrap value matters
+    td_errors[:, L - 1] = gamma * values_extended[:, L] - values_extended[:, L]  # No reward beyond
+
+    # Compute GAE advantages: A_t = Σ_{k=0}^{T-t-1} (γλ)^k δ_{t+k}
+    gae = torch.zeros(B, L, device=device)
+    running_gae = torch.zeros(B, device=device)
+    for t in range(L - 1, -1, -1):
+        running_gae = td_errors[:, t] + gamma * gae_lambda * running_gae
+        gae[:, t] = running_gae
+
+    # GAE λ-returns: G_t^λ = A_t + V(s_{t+1}) (since we want Q(s_t, a_t) targets)
+    # The target for Q(s_t, a_t) is the λ-return from taking action a_t
+    gae_returns = torch.zeros(B, L, device=device)
+    for t in range(L - 1):
+        gae_returns[:, t] = gae[:, t] + values_extended[:, t + 1]
+    gae_returns[:, L - 1] = values_extended[:, L]  # Bootstrap at the end
+
+    return gae_returns
+
+
 def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0, device="cpu",
-                ref_model=None, use_lm_rewards=False):
+                ref_model=None, use_lm_rewards=False, gae_lambda=None):
     """Training step for GPT2WithQ model.
 
     Args:
@@ -224,6 +283,8 @@ def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0
         device: device to run on
         ref_model: if provided and use_lm_rewards=True, compute rewards as log P(next_token)
         use_lm_rewards: if True, use log-probs from ref_model as rewards instead of batch rewards
+        gae_lambda: if provided, use GAE λ-returns instead of Monte Carlo returns.
+                    λ=0 gives TD(0), λ=1 gives Monte Carlo. Typical values: 0.95-0.99.
     """
     model.train()
     input_ids = batch["input_ids"].to(device)
@@ -284,7 +345,16 @@ def train_step(model, batch, optimizer, tokenizer, gamma=0.99, q_loss_weight=1.0
         bootstrap_values = (policy_probs * last_q).sum(dim=-1)  # (B,)
 
     # Compute return targets with bootstrapping at context boundary
-    returns = compute_discounted_returns_batch(rewards, gamma, bootstrap_values=bootstrap_values)
+    if gae_lambda is not None:
+        # Use GAE λ-returns: requires value estimates at each position
+        # V(s_t) = E_π[Q(s_t, a)] = Σ_a π(a|s_t) * Q(s_t, a)
+        with torch.no_grad():
+            all_policy_probs = torch.softmax(logits, dim=-1)  # (B, L, V)
+            values = (all_policy_probs * q_values).sum(dim=-1)  # (B, L)
+        returns = compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_values=bootstrap_values)
+    else:
+        # Use full Monte Carlo returns
+        returns = compute_discounted_returns_batch(rewards, gamma, bootstrap_values=bootstrap_values)
     returns_target = returns[:, :-1].contiguous()  # align with positions where next token exists
 
     # Mask out padded positions
@@ -918,6 +988,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--q_weight", type=float, default=1.0)
+    parser.add_argument("--gae_lambda", type=float, default=None,
+                        help="GAE lambda for Q-targets. None=MC returns, 0=TD(0), 1=MC. Typical: 0.95")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no_reference", action="store_true", help="Skip training reference model")
     parser.add_argument("--log_interval", type=int, default=100, help="Log every N steps")
@@ -939,7 +1011,18 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save_interval", type=int, default=1000, help="Save checkpoint every N steps")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (e.g., checkpoints/checkpoint_latest.pt)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    # Set seed if specified
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"Set random seed: {args.seed}")
 
     # Default to steps mode for streaming datasets, epochs for synthetic
     if args.steps is None and args.epochs is None:
@@ -964,9 +1047,11 @@ def main():
                 "lr": args.lr,
                 "gamma": args.gamma,
                 "q_weight": args.q_weight,
+                "gae_lambda": args.gae_lambda,
                 "max_len": args.max_len,
                 "use_lm_rewards": args.use_lm_rewards,
                 "save_interval": args.save_interval,
+                "seed": args.seed,
             }
         )
         print(f"W&B initialized: {wandb.run.url}")
@@ -1074,7 +1159,8 @@ def main():
             # Train Q-head model
             stats_q = train_step(model, batch, optimizer, tokenizer, gamma=args.gamma,
                                  q_loss_weight=args.q_weight, device=args.device,
-                                 ref_model=ref_model, use_lm_rewards=args.use_lm_rewards)
+                                 ref_model=ref_model, use_lm_rewards=args.use_lm_rewards,
+                                 gae_lambda=args.gae_lambda)
 
             # Accumulate scalar metrics
             for k, v in stats_q.items():
