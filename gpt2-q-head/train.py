@@ -145,17 +145,17 @@ def generate_with_q_tilt(model, tokenizer, prompt, max_new_tokens=50, beta=1.0,
     return generated_text, generated_tokens
 
 
-def estimate_batch_size(device, seq_len=48, model_name="gpt2", safety_factor=0.7):
+def estimate_batch_size(device, seq_len=48, model_name="gpt2", safety_factor=0.5):
     """Estimate optimal batch size based on available GPU memory.
 
     Args:
         device: torch device
         seq_len: sequence length
         model_name: model identifier for size estimation
-        safety_factor: fraction of memory to use (0.7 = 70%)
+        safety_factor: fraction of memory to use (0.5 = 50%, conservative to avoid OOM)
 
     Returns:
-        Estimated batch size (minimum 1, maximum 64)
+        Estimated batch size (minimum 1, maximum 16)
     """
     if device == "cpu" or not torch.cuda.is_available():
         return 8  # Conservative default for CPU
@@ -166,14 +166,15 @@ def estimate_batch_size(device, seq_len=48, model_name="gpt2", safety_factor=0.7
 
         # Rough estimates for GPT-2 small (124M params)
         # ~500MB base model, ~2KB per token per batch item for activations
-        base_memory_gb = 1.0  # Model + optimizer states (with reference model)
-        per_sample_gb = seq_len * 2e-6  # Rough activation memory per sample
+        # Note: training two models (Q-head + reference) doubles memory needs
+        base_memory_gb = 2.0  # Model + optimizer states (with reference model)
+        per_sample_gb = seq_len * 4e-6  # Rough activation memory per sample (increased for safety)
 
         available_gb = (total_memory_gb - base_memory_gb) * safety_factor
         estimated_batch = int(available_gb / per_sample_gb)
 
-        # Clamp to reasonable range
-        batch_size = max(1, min(64, estimated_batch))
+        # Clamp to reasonable range (max 16 to prevent OOM from memory fragmentation)
+        batch_size = max(1, min(16, estimated_batch))
 
         print(f"GPU: {gpu_props.name} ({total_memory_gb:.1f} GB)")
         print(f"Auto batch size: {batch_size} (seq_len={seq_len})")
@@ -1280,6 +1281,10 @@ def main():
                 acc_pos_arrays = {}
                 interval_count = 0
 
+                # Clear CUDA cache periodically to prevent memory fragmentation OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         pbar.close()
     else:
         # Epoch-based training (finite dataset)
@@ -1406,6 +1411,10 @@ def main():
                     acc_ref = {"lm_loss": 0.0, "perplexity": 0.0}
                     acc_pos_arrays = {}
                     interval_count = 0
+
+                    # Clear CUDA cache periodically to prevent memory fragmentation OOM
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Epoch summary
             print(f"{'-'*80}")
