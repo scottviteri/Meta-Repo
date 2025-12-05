@@ -283,7 +283,7 @@ def main():
     # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
     try:
-        step, saved_args = load_checkpoint(args.checkpoint, model, device=args.device)
+        step, saved_args, _ = load_checkpoint(args.checkpoint, model, device=args.device)
         if saved_args:
             print(f"Checkpoint training config: {saved_args}")
     except FileNotFoundError:
