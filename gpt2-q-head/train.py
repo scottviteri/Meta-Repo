@@ -4,8 +4,10 @@ Unified training script for GPT-2 variants.
 
 Modes:
   - normal: Standard GPT-2 (no Q-head), LM loss only
-  - qhead: GPT-2 with Q-head, using Monte Carlo returns
+  - qhead: GPT-2 with Q-head, using Monte Carlo returns (discounted sum of rewards)
   - gae: GPT-2 with Q-head, using GAE lambda-returns
+  - avglogprob: GPT-2 with Q-head, using average log probability of future tokens
+                as Q targets (intrinsic reward based on prediction confidence)
 
 Multiple modes can be specified to run sequentially.
 """
@@ -79,6 +81,61 @@ def compute_discounted_returns_batch(rewards, gamma, bootstrap_values=None):
     return returns
 
 
+def compute_avg_logprob_returns_batch(logits, target_tokens, attention_mask):
+    """Compute average log probability of future tokens as Q targets.
+
+    For each position t, computes the average log probability of all tokens
+    from position t+1 to the end of the sequence. This serves as an intrinsic
+    reward signal based on the model's prediction confidence.
+
+    Args:
+        logits: (B, L, V) model logits
+        target_tokens: (B, L-1) next tokens (shifted labels)
+        attention_mask: (B, L-1) mask for valid positions
+
+    Returns:
+        returns: (B, L-1) average log prob of future tokens at each position
+    """
+    B, L_minus_1 = target_tokens.shape
+    device = logits.device
+
+    # Compute log probabilities for each position
+    # shift_logits: (B, L-1, V), target_tokens: (B, L-1)
+    shift_logits = logits[:, :-1, :].contiguous()
+    log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, L-1, V)
+
+    # Get log prob of actual next tokens: (B, L-1)
+    token_log_probs = log_probs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+
+    # Mask out padding positions
+    mask = attention_mask.to(torch.float)
+    token_log_probs = token_log_probs * mask
+
+    # Compute average log prob of future tokens for each position
+    # At position t, we want mean(log_probs[t:]) for all valid future positions
+    returns = torch.zeros(B, L_minus_1, device=device)
+
+    for i in range(B):
+        # Find valid length for this sequence
+        valid_len = int(mask[i].sum().item())
+        if valid_len == 0:
+            continue
+
+        # Compute cumulative sum from the end (reverse cumsum)
+        seq_log_probs = token_log_probs[i, :valid_len]
+        cumsum_from_end = torch.flip(torch.cumsum(torch.flip(seq_log_probs, [0]), dim=0), [0])
+
+        # Count of future tokens at each position (including current)
+        counts = torch.arange(valid_len, 0, -1, device=device, dtype=torch.float)
+
+        # Average log prob of tokens from position t onwards
+        avg_log_probs = cumsum_from_end / counts
+
+        returns[i, :valid_len] = avg_log_probs
+
+    return returns
+
+
 def compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_values=None):
     """Compute GAE lambda-returns."""
     B, L = rewards.shape
@@ -108,8 +165,8 @@ def compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_valu
     return gae_returns
 
 
-def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, device="cpu", gae_lambda=None):
-    """Training step for GPT2WithQ model (qhead or gae mode)."""
+def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, device="cpu", gae_lambda=None, use_avg_logprob=False):
+    """Training step for GPT2WithQ model (qhead, gae, or avglogprob mode)."""
     model.train()
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -139,14 +196,19 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
         bootstrap_values = (policy_probs * last_q).sum(dim=-1)
 
     # Compute returns
-    if gae_lambda is not None:
+    if use_avg_logprob:
+        # Use average log probability of future tokens as Q targets
+        with torch.no_grad():
+            returns_target = compute_avg_logprob_returns_batch(logits, shift_labels, shift_mask)
+    elif gae_lambda is not None:
         with torch.no_grad():
             all_policy_probs = torch.softmax(logits, dim=-1)
             values = (all_policy_probs * q_values).sum(dim=-1)
         returns = compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_values=bootstrap_values)
+        returns_target = returns[:, :-1].contiguous()
     else:
         returns = compute_discounted_returns_batch(rewards, gamma, bootstrap_values=bootstrap_values)
-    returns_target = returns[:, :-1].contiguous()
+        returns_target = returns[:, :-1].contiguous()
 
     mask = shift_mask.to(torch.float)
     q_loss_per_pos = F.mse_loss(q_pred, returns_target, reduction="none") * mask
@@ -412,6 +474,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
     os.makedirs(save_dir, exist_ok=True)
 
     # Create model based on mode
+    use_avg_logprob = False
     if mode == "normal":
         config = GPT2Config.from_pretrained("gpt2")
         model = GPT2LMHeadModel(config)  # Random init
@@ -427,6 +490,12 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
         model = GPT2WithQ(config)  # Random init
         model.transformer.resize_token_embeddings(len(tokenizer))
         gae_lambda = args.gae_lambda
+    elif mode == "avglogprob":
+        config = GPT2Config.from_pretrained("gpt2")
+        model = GPT2WithQ(config)  # Random init
+        model.transformer.resize_token_embeddings(len(tokenizer))
+        gae_lambda = None
+        use_avg_logprob = True
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -483,6 +552,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                     "lr": args.lr,
                     "gamma": args.gamma,
                     "gae_lambda": gae_lambda,
+                    "use_avg_logprob": use_avg_logprob,
                     "max_len": args.max_len,
                 },
                 reinit=True
@@ -519,7 +589,8 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                 stats = train_step_normal(model, batch, optimizer, device=device)
             else:
                 stats = train_step_qhead(model, batch, optimizer, gamma=args.gamma,
-                                         q_loss_weight=args.q_weight, device=device, gae_lambda=gae_lambda)
+                                         q_loss_weight=args.q_weight, device=device, gae_lambda=gae_lambda,
+                                         use_avg_logprob=use_avg_logprob)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 skipped_batches += 1
@@ -590,7 +661,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
 def main():
     parser = argparse.ArgumentParser(description="Train GPT-2 variants")
     parser.add_argument("--mode", type=str, nargs="+", default=["qhead"],
-                        choices=["normal", "qhead", "gae"],
+                        choices=["normal", "qhead", "gae", "avglogprob"],
                         help="Training mode(s). Multiple modes run sequentially.")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (auto if not specified)")
