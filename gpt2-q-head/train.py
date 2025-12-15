@@ -188,13 +188,15 @@ def compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_valu
 
 
 def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, device="cpu",
-                     gae_lambda=None, use_avg_logprob=False, value_augmented_actor=False):
+                     gae_lambda=None, use_avg_logprob=False, value_augmented_actor=False,
+                     compute_diagnostics=False):
     """Training step for GPT2WithQ model (qhead, gae, or avglogprob mode).
 
     Args:
         value_augmented_actor: If True, augment actor loss with value function:
             actor_loss = -log P(token|ctx) - V(ctx) where V(ctx) = <P, Q>
             For discounted modes, V is multiplied by gamma.
+        compute_diagnostics: If True, compute and return detailed diagnostics.
     """
     model.train()
     input_ids = batch["input_ids"].to(device)
@@ -245,10 +247,12 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
     q_loss_per_pos = F.mse_loss(q_pred, returns_target, reduction="none") * mask
     q_loss = q_loss_per_pos.sum() / (mask.sum() + 1e-8)
 
+    # Compute policy probabilities and entropy for diagnostics
+    shift_policy_probs = torch.softmax(shift_logits, dim=-1)  # (B, L-1, V)
+
     # Compute actor loss: optionally augmented with value function
     if value_augmented_actor:
         # V(ctx) = <P(-|ctx), Q(ctx, -)> = expected Q under policy
-        shift_policy_probs = torch.softmax(shift_logits, dim=-1)  # (B, L-1, V)
         value_at_positions = (shift_policy_probs * shift_q).sum(dim=-1)  # (B, L-1)
 
         # For discounted modes, multiply V by gamma; for avglogprob, use V directly
@@ -265,22 +269,168 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
     else:
         actor_loss = lm_loss
         value_mean = torch.tensor(0.0, device=device)
+        value_at_positions = None
 
     loss = actor_loss + q_loss_weight * q_loss
 
     optimizer.zero_grad()
     loss.backward()
+
+    # Compute gradient norms before optimizer step (for diagnostics)
+    grad_norm_total = 0.0
+    grad_norm_lm = 0.0
+    grad_norm_qhead = 0.0
+    if compute_diagnostics:
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2).item() ** 2
+                grad_norm_total += param_norm
+                if 'q_head' in name:
+                    grad_norm_qhead += param_norm
+                else:
+                    grad_norm_lm += param_norm
+        grad_norm_total = grad_norm_total ** 0.5
+        grad_norm_lm = grad_norm_lm ** 0.5
+        grad_norm_qhead = grad_norm_qhead ** 0.5
+
     optimizer.step()
 
     perplexity = math.exp(lm_loss.item()) if lm_loss.item() < 100 else float('inf')
 
-    return {
+    stats = {
         "loss": loss.item(),
         "lm_loss": lm_loss.item(),
         "q_loss": q_loss.item(),
         "perplexity": perplexity,
         "value_mean": value_mean.item() if torch.is_tensor(value_mean) else value_mean,
     }
+
+    # Compute detailed diagnostics
+    if compute_diagnostics:
+        with torch.no_grad():
+            # Mask for valid positions
+            mask_bool = shift_mask.bool()
+            valid_count = mask.sum().item()
+
+            # === Q-value statistics ===
+            # Q predictions for chosen tokens
+            q_pred_valid = q_pred[mask_bool]
+            stats["q_pred_mean"] = q_pred_valid.mean().item()
+            stats["q_pred_std"] = q_pred_valid.std().item()
+            stats["q_pred_min"] = q_pred_valid.min().item()
+            stats["q_pred_max"] = q_pred_valid.max().item()
+
+            # All Q-values (full distribution over vocab)
+            # Flatten to (num_valid_positions, vocab_size)
+            flat_q = shift_q[mask_bool]  # (num_valid, V)
+            stats["q_all_mean"] = flat_q.mean().item()
+            stats["q_all_std"] = flat_q.std().item()
+            stats["q_all_min"] = flat_q.min().item()
+            stats["q_all_max"] = flat_q.max().item()
+
+            # === Returns/target statistics ===
+            returns_valid = returns_target[mask_bool]
+            stats["returns_mean"] = returns_valid.mean().item()
+            stats["returns_std"] = returns_valid.std().item()
+            stats["returns_min"] = returns_valid.min().item()
+            stats["returns_max"] = returns_valid.max().item()
+
+            # === Bellman error (Q_pred - target) ===
+            bellman_error = q_pred - returns_target
+            bellman_error_valid = bellman_error[mask_bool]
+            stats["bellman_error_mean"] = bellman_error_valid.mean().item()
+            stats["bellman_error_std"] = bellman_error_valid.std().item()
+            stats["bellman_error_abs_mean"] = bellman_error_valid.abs().mean().item()
+
+            # === Value function statistics (if value_augmented_actor) ===
+            if value_at_positions is not None:
+                value_valid = value_at_positions[mask_bool]
+                stats["value_fn_mean"] = value_valid.mean().item()
+                stats["value_fn_std"] = value_valid.std().item()
+                stats["value_fn_min"] = value_valid.min().item()
+                stats["value_fn_max"] = value_valid.max().item()
+
+            # === Policy entropy ===
+            # H = -sum(p * log(p))
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            entropy_per_pos = -(shift_policy_probs * log_probs).sum(dim=-1)  # (B, L-1)
+            entropy_valid = entropy_per_pos[mask_bool]
+            stats["policy_entropy_mean"] = entropy_valid.mean().item()
+            stats["policy_entropy_std"] = entropy_valid.std().item()
+            stats["policy_entropy_min"] = entropy_valid.min().item()
+            stats["policy_entropy_max"] = entropy_valid.max().item()
+
+            # === Token log probability statistics ===
+            token_log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            token_log_probs_valid = token_log_probs[mask_bool]
+            stats["token_logprob_mean"] = token_log_probs_valid.mean().item()
+            stats["token_logprob_std"] = token_log_probs_valid.std().item()
+            stats["token_logprob_min"] = token_log_probs_valid.min().item()
+            stats["token_logprob_max"] = token_log_probs_valid.max().item()
+
+            # === Logits statistics ===
+            logits_valid = shift_logits[mask_bool]
+            stats["logits_mean"] = logits_valid.mean().item()
+            stats["logits_std"] = logits_valid.std().item()
+            stats["logits_max"] = logits_valid.max().item()
+            stats["logits_min"] = logits_valid.min().item()
+
+            # === Gradient norms ===
+            stats["grad_norm_total"] = grad_norm_total
+            stats["grad_norm_lm"] = grad_norm_lm
+            stats["grad_norm_qhead"] = grad_norm_qhead
+
+            # === Q-head weight statistics ===
+            q_head_weight_norm = 0.0
+            q_head_weight_max = 0.0
+            for name, param in model.named_parameters():
+                if 'q_head' in name:
+                    q_head_weight_norm += param.data.norm(2).item() ** 2
+                    q_head_weight_max = max(q_head_weight_max, param.data.abs().max().item())
+            stats["qhead_weight_norm"] = q_head_weight_norm ** 0.5
+            stats["qhead_weight_max"] = q_head_weight_max
+
+            # === Actor loss components ===
+            stats["actor_loss"] = actor_loss.item()
+            stats["actor_loss_lm_component"] = lm_loss.item()
+            stats["actor_loss_value_component"] = -value_mean.item() if torch.is_tensor(value_mean) else -value_mean
+
+            # === Policy concentration: max probability ===
+            max_probs = shift_policy_probs.max(dim=-1)[0]  # (B, L-1)
+            max_probs_valid = max_probs[mask_bool]
+            stats["policy_max_prob_mean"] = max_probs_valid.mean().item()
+            stats["policy_max_prob_max"] = max_probs_valid.max().item()
+
+            # === Q-value for chosen token vs mean Q ===
+            q_mean_per_pos = shift_q.mean(dim=-1)  # (B, L-1)
+            q_advantage = q_pred - q_mean_per_pos  # Advantage of chosen token
+            q_advantage_valid = q_advantage[mask_bool]
+            stats["q_advantage_mean"] = q_advantage_valid.mean().item()
+            stats["q_advantage_std"] = q_advantage_valid.std().item()
+
+            # === Effective learning signal: correlation between Q and log prob ===
+            # Measures if higher Q tokens have higher probability
+            # Use Pearson correlation per position, then average
+            flat_q_all = flat_q  # (num_valid, V)
+            flat_logprobs_all = log_probs[mask_bool]  # (num_valid, V)
+            # Compute correlation for a sample of positions (expensive for full vocab)
+            # Sample up to 100 positions
+            num_sample = min(100, flat_q_all.size(0))
+            if num_sample > 0:
+                idx = torch.randperm(flat_q_all.size(0))[:num_sample]
+                sampled_q = flat_q_all[idx]  # (num_sample, V)
+                sampled_lp = flat_logprobs_all[idx]  # (num_sample, V)
+                # Compute mean-centered
+                q_centered = sampled_q - sampled_q.mean(dim=-1, keepdim=True)
+                lp_centered = sampled_lp - sampled_lp.mean(dim=-1, keepdim=True)
+                # Correlation per position
+                numerator = (q_centered * lp_centered).sum(dim=-1)
+                denom = (q_centered.norm(dim=-1) * lp_centered.norm(dim=-1) + 1e-8)
+                correlations = numerator / denom
+                stats["q_logprob_correlation_mean"] = correlations.mean().item()
+                stats["q_logprob_correlation_std"] = correlations.std().item()
+
+    return stats
 
 
 def train_step_normal(model, batch, optimizer, device="cpu"):
@@ -638,6 +788,8 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
         total_batches += 1
 
         # Train step with OOM handling
+        # Compute diagnostics on logging steps
+        is_log_step = ((global_step + 1) % args.log_interval == 0)
         try:
             if mode == "normal":
                 stats = train_step_normal(model, batch, optimizer, device=device)
@@ -645,7 +797,8 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                 stats = train_step_qhead(model, batch, optimizer, gamma=args.gamma,
                                          q_loss_weight=args.q_weight, device=device, gae_lambda=gae_lambda,
                                          use_avg_logprob=use_avg_logprob,
-                                         value_augmented_actor=args.value_augmented_actor)
+                                         value_augmented_actor=args.value_augmented_actor,
+                                         compute_diagnostics=(is_log_step and use_wandb))
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 skipped_batches += 1
@@ -700,6 +853,42 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                     log_dict["q_loss"] = avg_q
                     if args.value_augmented_actor:
                         log_dict["value_mean"] = avg_v
+
+                # Add all diagnostic stats from the last step (computed on log steps)
+                diagnostic_keys = [
+                    # Q-value statistics (chosen tokens)
+                    "q_pred_mean", "q_pred_std", "q_pred_min", "q_pred_max",
+                    # Q-value statistics (all tokens)
+                    "q_all_mean", "q_all_std", "q_all_min", "q_all_max",
+                    # Returns/targets
+                    "returns_mean", "returns_std", "returns_min", "returns_max",
+                    # Bellman error
+                    "bellman_error_mean", "bellman_error_std", "bellman_error_abs_mean",
+                    # Value function (when value_augmented_actor)
+                    "value_fn_mean", "value_fn_std", "value_fn_min", "value_fn_max",
+                    # Policy entropy
+                    "policy_entropy_mean", "policy_entropy_std", "policy_entropy_min", "policy_entropy_max",
+                    # Token log probabilities
+                    "token_logprob_mean", "token_logprob_std", "token_logprob_min", "token_logprob_max",
+                    # Logits statistics
+                    "logits_mean", "logits_std", "logits_max", "logits_min",
+                    # Gradient norms
+                    "grad_norm_total", "grad_norm_lm", "grad_norm_qhead",
+                    # Q-head weights
+                    "qhead_weight_norm", "qhead_weight_max",
+                    # Actor loss breakdown
+                    "actor_loss", "actor_loss_lm_component", "actor_loss_value_component",
+                    # Policy concentration
+                    "policy_max_prob_mean", "policy_max_prob_max",
+                    # Q advantage
+                    "q_advantage_mean", "q_advantage_std",
+                    # Q-logprob correlation
+                    "q_logprob_correlation_mean", "q_logprob_correlation_std",
+                ]
+                for key in diagnostic_keys:
+                    if key in stats:
+                        log_dict[key] = stats[key]
+
                 wandb.log(log_dict, step=global_step)
 
             acc = {"lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0, "value_mean": 0.0}
