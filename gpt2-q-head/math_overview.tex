@@ -1,0 +1,380 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{GPT-2 with Q-Head: Mathematical Overview}
+\author{Generated Documentation}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a mathematical overview of the GPT-2 with Q-head implementation. We describe the formulation of language modeling as a Markov Decision Process (MDP), the Q-function learning objective, various return computation methods (Monte Carlo, GAE, average log probability), and the value-augmented actor loss for non-myopic training.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+Standard language models are trained to maximize the likelihood of the next token given context, which is inherently \emph{myopic}---the model optimizes for immediate next-token prediction without considering the long-term consequences of its choices. This repository extends GPT-2 with a Q-head that learns to predict expected future returns, enabling:
+
+\begin{enumerate}
+    \item Non-myopic decision making through Q-value estimation
+    \item Value-augmented actor training that considers future outcomes
+    \item Flexible reward structures beyond immediate prediction accuracy
+\end{enumerate}
+
+\section{Problem Setup and Notation}
+
+\subsection{Language Modeling as an MDP}
+
+We formulate autoregressive language modeling as a Markov Decision Process (MDP):
+
+\begin{definition}[Language Model MDP]
+The language model MDP is defined by the tuple $(\mathcal{S}, \mathcal{A}, P, r, \gamma)$ where:
+\begin{itemize}
+    \item \textbf{State space} $\mathcal{S}$: The set of all possible token sequences (contexts). A state $s_t = (x_0, x_1, \ldots, x_t)$ is the sequence of tokens generated so far.
+    \item \textbf{Action space} $\mathcal{A} = \mathcal{V}$: The vocabulary of tokens. An action $a_t \in \mathcal{V}$ is the choice of the next token.
+    \item \textbf{Transition dynamics} $P(s_{t+1} | s_t, a_t)$: Deterministic---appending action $a_t$ to state $s_t$ yields $s_{t+1} = (s_t, a_t)$.
+    \item \textbf{Reward function} $r(s_t, a_t)$: Per-token reward signal (discussed in Section~\ref{sec:rewards}).
+    \item \textbf{Discount factor} $\gamma \in [0, 1]$: Temporal discounting for future rewards.
+\end{itemize}
+\end{definition}
+
+\subsection{Policy}
+
+The language model defines a policy $\pi_\theta(a | s)$ parameterized by $\theta$:
+\begin{equation}
+    \pi_\theta(a | s_t) = \frac{\exp(f_\theta(s_t)_a)}{\sum_{a' \in \mathcal{V}} \exp(f_\theta(s_t)_{a'})} = \text{softmax}(f_\theta(s_t))_a
+\end{equation}
+where $f_\theta(s_t) \in \mathbb{R}^{|\mathcal{V}|}$ are the logits produced by the language model head.
+
+\section{Standard Language Model Training}
+
+\subsection{Maximum Likelihood Objective}
+
+The standard language modeling objective maximizes the log-likelihood of observed sequences:
+\begin{equation}
+    \mathcal{L}_{\text{LM}}(\theta) = -\mathbb{E}_{(x_0, \ldots, x_L) \sim \mathcal{D}} \left[ \sum_{t=0}^{L-1} \log \pi_\theta(x_{t+1} | x_{\leq t}) \right]
+\end{equation}
+
+This is equivalent to minimizing the cross-entropy loss:
+\begin{equation}
+    \mathcal{L}_{\text{CE}}(\theta) = -\frac{1}{L} \sum_{t=0}^{L-1} \log \pi_\theta(x_{t+1} | x_{\leq t})
+\end{equation}
+
+\subsection{Myopia of Standard Training}
+
+Standard LM training is \emph{myopic}: at each position $t$, the model is rewarded only for predicting the immediate next token $x_{t+1}$, without considering how this prediction affects future tokens. This can lead to suboptimal behavior when:
+\begin{itemize}
+    \item Early token choices constrain or enable future generation quality
+    \item Long-range coherence matters beyond local fluency
+    \item External reward signals depend on future outcomes
+\end{itemize}
+
+\section{Q-Function for Language Models}
+
+\subsection{Q-Function Definition}
+
+\begin{definition}[Action-Value Function]
+The Q-function $Q^\pi(s, a)$ represents the expected cumulative discounted return when taking action $a$ in state $s$ and following policy $\pi$ thereafter:
+\begin{equation}
+    Q^\pi(s_t, a_t) = \mathbb{E}_\pi \left[ \sum_{k=0}^{\infty} \gamma^k r_{t+k+1} \,\Big|\, s_t, a_t \right]
+\end{equation}
+where $r_{t+k+1} = r(s_{t+k}, a_{t+k})$ is the reward at step $t+k$.
+\end{definition}
+
+\subsection{Value Function}
+
+The state-value function is the expected Q-value under the policy:
+\begin{equation}
+    V^\pi(s_t) = \mathbb{E}_{a \sim \pi(\cdot|s_t)}[Q^\pi(s_t, a)] = \sum_{a \in \mathcal{V}} \pi(a | s_t) \cdot Q^\pi(s_t, a) = \langle \pi(\cdot|s_t), Q^\pi(s_t, \cdot) \rangle
+\end{equation}
+
+\subsection{Model Architecture}
+
+The GPT-2 with Q-head model has two output heads sharing the same transformer backbone:
+\begin{align}
+    h_t &= \text{Transformer}(x_{\leq t}) \in \mathbb{R}^d \\
+    \text{logits}_t &= W_{\text{LM}} \cdot h_t \in \mathbb{R}^{|\mathcal{V}|} \quad \text{(LM head)} \\
+    Q_t &= W_Q \cdot h_t \in \mathbb{R}^{|\mathcal{V}|} \quad \text{(Q head)}
+\end{align}
+where $Q_t[a]$ represents $Q_\theta(s_t, a)$ for each possible action $a \in \mathcal{V}$.
+
+\section{Return Computation Methods}
+\label{sec:returns}
+
+The Q-function is trained via regression to target returns. We implement several methods for computing these targets.
+
+\subsection{Monte Carlo Returns (Discounted Sum)}
+
+For a trajectory of rewards $(r_0, r_1, \ldots, r_{L-1})$, the Monte Carlo return at position $t$ is:
+\begin{equation}
+    G_t = \sum_{k=0}^{L-1-t} \gamma^k r_{t+k} = r_t + \gamma r_{t+1} + \gamma^2 r_{t+2} + \cdots
+\end{equation}
+
+\textbf{Implementation note:} In our implementation, to avoid double-counting when using value-augmented actor loss, we compute \emph{pure future} returns:
+\begin{equation}
+    G_t^{\text{future}} = \sum_{k=1}^{L-1-t} \gamma^{k-1} r_{t+k} = \gamma r_{t+1} + \gamma^2 r_{t+2} + \cdots = \gamma G_{t+1}
+\end{equation}
+
+With bootstrapping at the sequence end:
+\begin{equation}
+    G_t^{\text{future}} = \gamma r_{t+1} + \gamma^2 r_{t+2} + \cdots + \gamma^{L-t} V(s_L)
+\end{equation}
+
+\subsection{Generalized Advantage Estimation (GAE)}
+
+GAE~\cite{schulman2015high} provides a bias-variance tradeoff through the $\lambda$ parameter.
+
+\begin{definition}[TD Error]
+The temporal difference error is:
+\begin{equation}
+    \delta_t = r_{t+1} + \gamma V(s_{t+1}) - V(s_t)
+\end{equation}
+\end{definition}
+
+\begin{definition}[GAE]
+The generalized advantage estimate is:
+\begin{equation}
+    \hat{A}_t^{\text{GAE}(\gamma, \lambda)} = \sum_{k=0}^{\infty} (\gamma \lambda)^k \delta_{t+k}
+\end{equation}
+\end{definition}
+
+The GAE $\lambda$-return target for Q-learning is:
+\begin{equation}
+    G_t^\lambda = \hat{A}_t^{\text{GAE}} + V(s_t)
+\end{equation}
+
+Special cases:
+\begin{itemize}
+    \item $\lambda = 1$: Monte Carlo return (high variance, low bias)
+    \item $\lambda = 0$: One-step TD return $r_{t+1} + \gamma V(s_{t+1})$ (low variance, high bias)
+\end{itemize}
+
+\subsection{Average Log Probability of Future Tokens}
+\label{sec:avglogprob}
+
+Instead of external rewards, we can use the model's own prediction confidence as an intrinsic reward signal.
+
+\begin{definition}[Average Log Probability Return]
+For position $t$, the average log probability return is:
+\begin{equation}
+    G_t^{\text{avglogprob}} = \frac{1}{L - t - 1} \sum_{k=t+1}^{L-1} \log \pi_\theta(x_{k+1} | x_{\leq k})
+\end{equation}
+This is the average log probability of correctly predicting all \emph{future} tokens (from position $t+1$ onwards).
+\end{definition}
+
+\begin{remark}[Pure Future]
+Note that this is the average of log probabilities for positions \emph{after} $t$, not including position $t$ itself. This avoids double-counting when combined with value-augmented actor loss.
+\end{remark}
+
+\textbf{Intuition:} $G_t^{\text{avglogprob}}$ measures how ``predictable'' the remainder of the sequence is. A high value indicates that future tokens are easily predicted given the context, while a low value suggests the sequence becomes harder to predict.
+
+\textbf{No bootstrapping:} Unlike discounted returns, avglogprob mode does not use bootstrapping at the sequence boundary---it only considers tokens within the context window.
+
+\section{Q-Function Training}
+
+\subsection{Q-Loss}
+
+The Q-head is trained via mean squared error regression:
+\begin{equation}
+    \mathcal{L}_Q(\theta) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \left( Q_\theta(s_t, a_t) - G_t \right)^2
+\end{equation}
+where:
+\begin{itemize}
+    \item $a_t = x_{t+1}$ is the actually observed next token
+    \item $G_t$ is the target return (computed via Monte Carlo, GAE, or avglogprob)
+    \item $\mathcal{T}$ is the set of valid (non-padded) positions
+\end{itemize}
+
+\subsection{On-Policy Limitation}
+
+We only supervise $Q(s_t, a_t)$ for the \emph{taken} action $a_t$. This is on-policy learning---we learn Q-values only for actions that were actually taken in the training data. Off-policy learning (estimating Q-values for counterfactual actions) would require additional techniques such as importance sampling or model-based rollouts.
+
+\section{Value-Augmented Actor Loss}
+
+\subsection{Motivation: Non-Myopic Training}
+
+Standard LM loss trains the actor (policy) myopically. To encourage the model to consider future outcomes, we augment the actor loss with the value function.
+
+\subsection{Augmented Objective}
+
+\begin{definition}[Value-Augmented Actor Loss]
+The value-augmented actor loss at position $t$ is:
+\begin{equation}
+    \ell_t^{\text{actor}} = -\log \pi_\theta(x_{t+1} | x_{\leq t}) - \alpha \cdot V(s_t)
+\end{equation}
+where $V(s_t) = \langle \pi_\theta(\cdot|s_t), Q_\theta(s_t, \cdot) \rangle$ is the expected Q-value under the current policy.
+\end{definition}
+
+The total actor loss is:
+\begin{equation}
+    \mathcal{L}_{\text{actor}}(\theta) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \ell_t^{\text{actor}}
+\end{equation}
+
+\subsection{Discount Factor Adjustment}
+
+For temporal consistency, the coefficient $\alpha$ depends on the return computation method:
+\begin{equation}
+    \alpha = \begin{cases}
+        \gamma & \text{for discounted returns (qhead, gae modes)} \\
+        1 & \text{for avglogprob mode}
+    \end{cases}
+\end{equation}
+
+\textbf{Rationale:} In the discounted case, $Q(s_t, a_t)$ represents future rewards starting from the \emph{next} timestep. Multiplying $V(s_t)$ by $\gamma$ maintains the correct temporal relationship:
+\begin{equation}
+    \log \pi(a_t|s_t) + \gamma V(s_t) \approx \log \pi(a_t|s_t) + \gamma \mathbb{E}[G_{t+1}]
+\end{equation}
+
+\subsection{Avoiding Double Counting}
+
+When using value-augmented actor loss, the Q-targets must be \emph{pure future} (not including the current step's reward) to avoid double-counting:
+\begin{itemize}
+    \item The actor loss already includes $\log \pi(a_t|s_t)$ for the current position
+    \item Adding $V(s_t)$ provides the expected future value
+    \item If $Q$ included the current reward, it would be counted twice
+\end{itemize}
+
+\section{Combined Training Objective}
+
+The full training objective combines actor and critic losses:
+\begin{equation}
+    \mathcal{L}(\theta) = \mathcal{L}_{\text{actor}}(\theta) + \beta \cdot \mathcal{L}_Q(\theta)
+\end{equation}
+where $\beta$ (controlled by \texttt{--q\_weight}) balances the two objectives.
+
+\subsection{Gradient Flow}
+
+Both losses share the transformer backbone, so gradients flow through:
+\begin{enumerate}
+    \item \textbf{LM head} $\leftarrow$ $\mathcal{L}_{\text{actor}}$ (via log probabilities)
+    \item \textbf{Q head} $\leftarrow$ $\mathcal{L}_Q$ (via Q-value predictions)
+    \item \textbf{Transformer} $\leftarrow$ Both losses (shared representations)
+\end{enumerate}
+
+When \texttt{value\_augmented\_actor} is enabled, the actor loss also depends on Q-values through $V(s_t)$, creating additional gradient pathways.
+
+\section{Algorithm Summary}
+
+\begin{algorithm}[H]
+\caption{GPT-2 with Q-Head Training Step}
+\begin{algorithmic}[1]
+\Require Batch of sequences $\{(x^{(i)}_0, \ldots, x^{(i)}_L)\}_{i=1}^B$, rewards $\{r^{(i)}\}$
+\Require Parameters: $\gamma$, $\lambda$ (for GAE), $\beta$ (Q-loss weight), mode
+
+\State \textbf{Forward pass:}
+\State $\quad$ Compute logits and Q-values: $(\text{logits}, Q) \gets \text{Model}(x)$
+\State $\quad$ Policy: $\pi \gets \text{softmax}(\text{logits})$
+
+\State \textbf{Compute LM loss:}
+\State $\quad$ $\mathcal{L}_{\text{LM}} \gets -\frac{1}{|\mathcal{T}|}\sum_{t} \log \pi(x_{t+1} | x_{\leq t})$
+
+\State \textbf{Compute Q-targets:}
+\If{mode = avglogprob}
+    \State $G_t \gets \frac{1}{L-t-1}\sum_{k=t+1}^{L-1} \log \pi(x_{k+1}|x_{\leq k})$ \Comment{Pure future avg log prob}
+\ElsIf{mode = gae}
+    \State $G_t \gets \text{GAE-}\lambda\text{-returns}(r, V, \gamma, \lambda)$
+\Else
+    \State $G_t \gets \text{DiscountedReturns}(r, \gamma)$ \Comment{Pure future}
+\EndIf
+
+\State \textbf{Compute Q-loss:}
+\State $\quad$ $\mathcal{L}_Q \gets \frac{1}{|\mathcal{T}|}\sum_t (Q(s_t, x_{t+1}) - G_t)^2$
+
+\State \textbf{Compute actor loss:}
+\If{value\_augmented\_actor}
+    \State $V_t \gets \langle \pi(\cdot|s_t), Q(s_t, \cdot) \rangle$
+    \State $\alpha \gets \gamma$ if discounted else $1$
+    \State $\mathcal{L}_{\text{actor}} \gets \mathcal{L}_{\text{LM}} - \alpha \cdot \frac{1}{|\mathcal{T}|}\sum_t V_t$
+\Else
+    \State $\mathcal{L}_{\text{actor}} \gets \mathcal{L}_{\text{LM}}$
+\EndIf
+
+\State \textbf{Total loss and update:}
+\State $\mathcal{L} \gets \mathcal{L}_{\text{actor}} + \beta \cdot \mathcal{L}_Q$
+\State $\theta \gets \theta - \eta \nabla_\theta \mathcal{L}$
+
+\end{algorithmic}
+\end{algorithm}
+
+\section{Q-Tilted Sampling}
+
+At inference time, Q-values can be used to adjust the sampling distribution:
+
+\begin{definition}[Q-Tilted Distribution]
+The Q-tilted sampling distribution is:
+\begin{equation}
+    \tilde{\pi}_\beta(a | s) \propto \pi(a|s) \cdot \exp\left(\frac{Q(s, a)}{\beta}\right) = \text{softmax}\left(\text{logits}(s) + \frac{Q(s, \cdot)}{\beta}\right)
+\end{equation}
+where $\beta > 0$ is a temperature parameter controlling the influence of Q-values.
+\end{definition}
+
+\begin{itemize}
+    \item $\beta \to \infty$: Standard language model sampling
+    \item $\beta \to 0$: Greedy Q-value maximization
+    \item Intermediate $\beta$: Balanced exploration-exploitation
+\end{itemize}
+
+\section{Implementation Details}
+
+\subsection{Masking}
+
+All losses are computed only over valid (non-padded) positions using attention masks.
+
+\subsection{Bootstrapping}
+
+For discounted returns at the sequence boundary, we bootstrap using:
+\begin{equation}
+    V(s_L) = \langle \pi(\cdot|s_L), Q(s_L, \cdot) \rangle
+\end{equation}
+This allows value to propagate beyond the context window.
+
+For avglogprob mode, no bootstrapping is used---returns are computed purely from tokens within the sequence.
+
+\subsection{Computational Considerations}
+
+\begin{itemize}
+    \item The Q-head adds $|\mathcal{V}| \times d$ parameters (same as LM head)
+    \item Forward pass computes both logits and Q-values in parallel
+    \item Return computation is $O(L)$ per sequence
+    \item Memory usage scales with $B \times L \times |\mathcal{V}|$ for Q-values
+\end{itemize}
+
+\section{Conclusion}
+
+This implementation provides a flexible framework for training language models with Q-function estimation. Key features include:
+
+\begin{enumerate}
+    \item Multiple return computation methods (Monte Carlo, GAE, avglogprob)
+    \item Value-augmented actor loss for non-myopic training
+    \item Careful handling of temporal structure to avoid double-counting
+    \item Q-tilted sampling for inference-time control
+\end{enumerate}
+
+The avglogprob mode is particularly interesting as it uses prediction confidence as an intrinsic reward, potentially encouraging the model to make choices that lead to more predictable (coherent) continuations.
+
+\begin{thebibliography}{9}
+\bibitem{schulman2015high}
+Schulman, J., Moritz, P., Levine, S., Jordan, M., \& Abbeel, P. (2015).
+High-dimensional continuous control using generalized advantage estimation.
+\textit{arXiv preprint arXiv:1506.02438}.
+
+\bibitem{sutton2018reinforcement}
+Sutton, R. S., \& Barto, A. G. (2018).
+\textit{Reinforcement learning: An introduction}.
+MIT press.
+\end{thebibliography}
+
+\end{document}

@@ -4,8 +4,17 @@ Unified training script for GPT-2 variants.
 
 Modes:
   - normal: Standard GPT-2 (no Q-head), LM loss only
-  - qhead: GPT-2 with Q-head, using Monte Carlo returns
+  - qhead: GPT-2 with Q-head, using Monte Carlo returns (discounted sum of rewards)
   - gae: GPT-2 with Q-head, using GAE lambda-returns
+  - avglogprob: GPT-2 with Q-head, using average log probability of FUTURE tokens
+                as Q targets (intrinsic reward based on prediction confidence).
+                Q targets are pure future (from t+1 onwards) to avoid double counting.
+
+Options:
+  --value_augmented_actor: Augment actor loss with value function for non-myopic training:
+      actor_loss = -log P(token|ctx) - V(ctx) where V(ctx) = <P, Q>
+      For discounted modes (qhead, gae), V is multiplied by gamma.
+      The Q-function targets pure future rewards to avoid double counting.
 
 Multiple modes can be specified to run sequentially.
 """
@@ -79,6 +88,76 @@ def compute_discounted_returns_batch(rewards, gamma, bootstrap_values=None):
     return returns
 
 
+def compute_avg_logprob_returns_batch(logits, target_tokens, attention_mask):
+    """Compute average log probability of FUTURE tokens as Q targets.
+
+    For each position t, computes the average log probability of all tokens
+    from position t+1 to the end of the sequence (pure future, excluding current).
+    This serves as an intrinsic reward signal based on the model's prediction
+    confidence for future tokens.
+
+    Args:
+        logits: (B, L, V) model logits
+        target_tokens: (B, L-1) next tokens (shifted labels)
+        attention_mask: (B, L-1) mask for valid positions
+
+    Returns:
+        returns: (B, L-1) average log prob of FUTURE tokens at each position
+                 (i.e., mean of log_probs[t+1:] for position t)
+    """
+    B, L_minus_1 = target_tokens.shape
+    device = logits.device
+
+    # Compute log probabilities for each position
+    # shift_logits: (B, L-1, V), target_tokens: (B, L-1)
+    shift_logits = logits[:, :-1, :].contiguous()
+    log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, L-1, V)
+
+    # Get log prob of actual next tokens: (B, L-1)
+    token_log_probs = log_probs.gather(-1, target_tokens.unsqueeze(-1)).squeeze(-1)
+
+    # Mask out padding positions
+    mask = attention_mask.to(torch.float)
+    token_log_probs = token_log_probs * mask
+
+    # Compute average log prob of FUTURE tokens for each position
+    # At position t, we want mean(log_probs[t+1:]) - pure future excluding current
+    returns = torch.zeros(B, L_minus_1, device=device)
+
+    for i in range(B):
+        # Find valid length for this sequence
+        valid_len = int(mask[i].sum().item())
+        if valid_len <= 1:
+            # No future tokens for any position
+            continue
+
+        # Compute cumulative sum from the end (reverse cumsum)
+        seq_log_probs = token_log_probs[i, :valid_len]
+        cumsum_from_end = torch.flip(torch.cumsum(torch.flip(seq_log_probs, [0]), dim=0), [0])
+
+        # For pure future: at position t, we want sum(log_probs[t+1:]) / count(t+1:)
+        # cumsum_from_end[t] = sum(log_probs[t:valid_len])
+        # So sum(log_probs[t+1:]) = cumsum_from_end[t+1] for t < valid_len-1
+        future_cumsum = torch.zeros(valid_len, device=device)
+        future_cumsum[:-1] = cumsum_from_end[1:]  # shift left by 1
+        # future_cumsum[t] = sum(log_probs[t+1:]) for t < valid_len-1, and 0 for t=valid_len-1
+
+        # Count of future tokens at position t: valid_len - t - 1
+        counts = torch.arange(valid_len - 1, -1, -1, device=device, dtype=torch.float)
+        # counts[t] = valid_len - 1 - t = number of tokens after position t
+
+        # Avoid division by zero at last position (where count=0)
+        # Last position has no future, so avg should be 0
+        safe_counts = torch.clamp(counts, min=1.0)
+        avg_log_probs = future_cumsum / safe_counts
+        # Set last position explicitly to 0 (no future tokens)
+        avg_log_probs[-1] = 0.0
+
+        returns[i, :valid_len] = avg_log_probs
+
+    return returns
+
+
 def compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_values=None):
     """Compute GAE lambda-returns."""
     B, L = rewards.shape
@@ -108,8 +187,15 @@ def compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_valu
     return gae_returns
 
 
-def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, device="cpu", gae_lambda=None):
-    """Training step for GPT2WithQ model (qhead or gae mode)."""
+def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, device="cpu",
+                     gae_lambda=None, use_avg_logprob=False, value_augmented_actor=False):
+    """Training step for GPT2WithQ model (qhead, gae, or avglogprob mode).
+
+    Args:
+        value_augmented_actor: If True, augment actor loss with value function:
+            actor_loss = -log P(token|ctx) - V(ctx) where V(ctx) = <P, Q>
+            For discounted modes, V is multiplied by gamma.
+    """
     model.train()
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -131,28 +217,56 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
     next_tokens = shift_labels
     q_pred = shift_q.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)
 
-    # Bootstrap values
-    with torch.no_grad():
-        last_logits = logits[:, -1, :]
-        last_q = q_values[:, -1, :]
-        policy_probs = torch.softmax(last_logits, dim=-1)
-        bootstrap_values = (policy_probs * last_q).sum(dim=-1)
+    # Bootstrap values (not used for avglogprob)
+    bootstrap_values = None
+    if not use_avg_logprob:
+        with torch.no_grad():
+            last_logits = logits[:, -1, :]
+            last_q = q_values[:, -1, :]
+            policy_probs = torch.softmax(last_logits, dim=-1)
+            bootstrap_values = (policy_probs * last_q).sum(dim=-1)
 
-    # Compute returns
-    if gae_lambda is not None:
+    # Compute returns (Q targets are pure future rewards to avoid double counting)
+    if use_avg_logprob:
+        # Use average log probability of FUTURE tokens as Q targets (no bootstrapping)
+        with torch.no_grad():
+            returns_target = compute_avg_logprob_returns_batch(logits, shift_labels, shift_mask)
+    elif gae_lambda is not None:
         with torch.no_grad():
             all_policy_probs = torch.softmax(logits, dim=-1)
             values = (all_policy_probs * q_values).sum(dim=-1)
         returns = compute_gae_returns_batch(rewards, values, gamma, gae_lambda, bootstrap_values=bootstrap_values)
+        returns_target = returns[:, :-1].contiguous()
     else:
         returns = compute_discounted_returns_batch(rewards, gamma, bootstrap_values=bootstrap_values)
-    returns_target = returns[:, :-1].contiguous()
+        returns_target = returns[:, :-1].contiguous()
 
     mask = shift_mask.to(torch.float)
     q_loss_per_pos = F.mse_loss(q_pred, returns_target, reduction="none") * mask
     q_loss = q_loss_per_pos.sum() / (mask.sum() + 1e-8)
 
-    loss = lm_loss + q_loss_weight * q_loss
+    # Compute actor loss: optionally augmented with value function
+    if value_augmented_actor:
+        # V(ctx) = <P(-|ctx), Q(ctx, -)> = expected Q under policy
+        shift_policy_probs = torch.softmax(shift_logits, dim=-1)  # (B, L-1, V)
+        value_at_positions = (shift_policy_probs * shift_q).sum(dim=-1)  # (B, L-1)
+
+        # For discounted modes, multiply V by gamma; for avglogprob, use V directly
+        if use_avg_logprob:
+            value_term = value_at_positions
+        else:
+            value_term = gamma * value_at_positions
+
+        # Masked mean of value term
+        value_mean = (value_term * mask).sum() / (mask.sum() + 1e-8)
+
+        # Actor loss = lm_loss - value_mean (to maximize log P + V)
+        actor_loss = lm_loss - value_mean
+    else:
+        actor_loss = lm_loss
+        value_mean = torch.tensor(0.0, device=device)
+
+    loss = actor_loss + q_loss_weight * q_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -165,6 +279,7 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
         "lm_loss": lm_loss.item(),
         "q_loss": q_loss.item(),
         "perplexity": perplexity,
+        "value_mean": value_mean.item() if torch.is_tensor(value_mean) else value_mean,
     }
 
 
@@ -412,6 +527,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
     os.makedirs(save_dir, exist_ok=True)
 
     # Create model based on mode
+    use_avg_logprob = False
     if mode == "normal":
         config = GPT2Config.from_pretrained("gpt2")
         model = GPT2LMHeadModel(config)  # Random init
@@ -427,6 +543,12 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
         model = GPT2WithQ(config)  # Random init
         model.transformer.resize_token_embeddings(len(tokenizer))
         gae_lambda = args.gae_lambda
+    elif mode == "avglogprob":
+        config = GPT2Config.from_pretrained("gpt2")
+        model = GPT2WithQ(config)  # Random init
+        model.transformer.resize_token_embeddings(len(tokenizer))
+        gae_lambda = None
+        use_avg_logprob = True
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -483,6 +605,8 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                     "lr": args.lr,
                     "gamma": args.gamma,
                     "gae_lambda": gae_lambda,
+                    "use_avg_logprob": use_avg_logprob,
+                    "value_augmented_actor": args.value_augmented_actor,
                     "max_len": args.max_len,
                 },
                 reinit=True
@@ -498,7 +622,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
     data_iter = iter(dataloader)
     pbar = tqdm(total=args.steps, initial=start_step, desc=f"Training ({mode})")
 
-    acc = {"lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+    acc = {"lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0, "value_mean": 0.0}
     interval_count = 0
     skipped_batches = 0
     total_batches = 0
@@ -519,7 +643,9 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                 stats = train_step_normal(model, batch, optimizer, device=device)
             else:
                 stats = train_step_qhead(model, batch, optimizer, gamma=args.gamma,
-                                         q_loss_weight=args.q_weight, device=device, gae_lambda=gae_lambda)
+                                         q_loss_weight=args.q_weight, device=device, gae_lambda=gae_lambda,
+                                         use_avg_logprob=use_avg_logprob,
+                                         value_augmented_actor=args.value_augmented_actor)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 skipped_batches += 1
@@ -537,6 +663,8 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
         acc["perplexity"] += stats["perplexity"]
         if "q_loss" in stats:
             acc["q_loss"] += stats["q_loss"]
+        if "value_mean" in stats:
+            acc["value_mean"] += stats["value_mean"]
 
         global_step += 1
         interval_count += 1
@@ -551,9 +679,12 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
             avg_lm = acc["lm_loss"] / interval_count
             avg_ppl = acc["perplexity"] / interval_count
             avg_q = acc["q_loss"] / interval_count if mode != "normal" else 0
+            avg_v = acc["value_mean"] / interval_count if args.value_augmented_actor and mode != "normal" else 0
 
             if mode == "normal":
                 tqdm.write(f"{global_step:>8} | {avg_lm:>10.4f} {avg_ppl:>10.2f}")
+            elif args.value_augmented_actor:
+                tqdm.write(f"{global_step:>8} | {avg_lm:>10.4f} {avg_ppl:>10.2f} | Q:{avg_q:.4f} V:{avg_v:.4f}")
             else:
                 tqdm.write(f"{global_step:>8} | {avg_lm:>10.4f} {avg_ppl:>10.2f} | {avg_q:.4f}")
 
@@ -567,9 +698,11 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
                 }
                 if mode != "normal":
                     log_dict["q_loss"] = avg_q
+                    if args.value_augmented_actor:
+                        log_dict["value_mean"] = avg_v
                 wandb.log(log_dict, step=global_step)
 
-            acc = {"lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0}
+            acc = {"lm_loss": 0.0, "q_loss": 0.0, "perplexity": 0.0, "value_mean": 0.0}
             interval_count = 0
 
             if torch.cuda.is_available():
@@ -590,7 +723,7 @@ def run_training(mode, args, tokenizer, device, resume_from=None):
 def main():
     parser = argparse.ArgumentParser(description="Train GPT-2 variants")
     parser.add_argument("--mode", type=str, nargs="+", default=["qhead"],
-                        choices=["normal", "qhead", "gae"],
+                        choices=["normal", "qhead", "gae", "avglogprob"],
                         help="Training mode(s). Multiple modes run sequentially.")
     parser.add_argument("--steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (auto if not specified)")
@@ -598,6 +731,9 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--q_weight", type=float, default=1.0, help="Weight for Q loss")
     parser.add_argument("--gae_lambda", type=float, default=0.95, help="GAE lambda (for gae mode)")
+    parser.add_argument("--value_augmented_actor", action="store_true",
+                        help="Augment actor loss with value function: actor_loss = -log P - V(ctx). "
+                             "V is multiplied by gamma for discounted modes.")
     parser.add_argument("--max_len", type=int, default=128, help="Max sequence length")
     parser.add_argument("--dataset", type=str, default="wikipedia",
                         choices=["wikipedia", "openwebtext", "c4"],
