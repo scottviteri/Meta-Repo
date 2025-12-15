@@ -253,7 +253,9 @@ def train_step_qhead(model, batch, optimizer, gamma=0.99, q_loss_weight=1.0, dev
     # Compute actor loss: optionally augmented with value function
     if value_augmented_actor:
         # V(ctx) = <P(-|ctx), Q(ctx, -)> = expected Q under policy
-        value_at_positions = (shift_policy_probs * shift_q).sum(dim=-1)  # (B, L-1)
+        # IMPORTANT: Detach Q-values so actor loss only updates policy, not Q-head.
+        # Without detach, gradient of -V w.r.t. Q is -P, which pushes Q arbitrarily high.
+        value_at_positions = (shift_policy_probs * shift_q.detach()).sum(dim=-1)  # (B, L-1)
 
         # For discounted modes, multiply V by gamma; for avglogprob, use V directly
         if use_avg_logprob:
