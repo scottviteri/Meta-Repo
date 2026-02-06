@@ -1,0 +1,14 @@
+# Working directory — downloaded CDX indexes, PDFs, WARC fragments
+work/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Rendered page images
+*.png
+
+# Temporary extraction artifacts
+rec_*.warc
+rec_*.warc.gz
