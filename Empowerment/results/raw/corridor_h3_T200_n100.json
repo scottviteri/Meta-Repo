@@ -1,0 +1,101 @@
+[
+  {
+    "policy": "greedy",
+    "temperature": null,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.0,
+    "mean_visitation_entropy": 1.301313397052807,
+    "std_visitation_entropy": 0.018274320503342278,
+    "mean_distinct_states": 6.0,
+    "mean_empowerment_visited": 2.860518669329248,
+    "std_empowerment_visited": 0.0005070929692754896
+  },
+  {
+    "policy": "softmax",
+    "temperature": 0.01,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.0,
+    "mean_visitation_entropy": 1.3114777969814186,
+    "std_visitation_entropy": 0.02228800713329942,
+    "mean_distinct_states": 6.34,
+    "mean_empowerment_visited": 2.8603786312153403,
+    "std_empowerment_visited": 0.0005214313929661667
+  },
+  {
+    "policy": "softmax",
+    "temperature": 0.03,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.0,
+    "mean_visitation_entropy": 1.6462803572827922,
+    "std_visitation_entropy": 0.07280163391947275,
+    "mean_distinct_states": 9.08,
+    "mean_empowerment_visited": 2.853377455104139,
+    "std_empowerment_visited": 0.001972856181577245
+  },
+  {
+    "policy": "softmax",
+    "temperature": 0.1,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.0,
+    "mean_visitation_entropy": 2.3571092282917947,
+    "std_visitation_entropy": 0.11372661360657539,
+    "mean_distinct_states": 16.65,
+    "mean_empowerment_visited": 2.819995966714635,
+    "std_empowerment_visited": 0.008059957937079948
+  },
+  {
+    "policy": "softmax",
+    "temperature": 0.3,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.1,
+    "mean_visitation_entropy": 2.9608224495987447,
+    "std_visitation_entropy": 0.1806849087396874,
+    "mean_distinct_states": 26.01,
+    "mean_empowerment_visited": 2.7512214478221724,
+    "std_empowerment_visited": 0.016245483403939057
+  },
+  {
+    "policy": "softmax",
+    "temperature": 1.0,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.29,
+    "mean_visitation_entropy": 3.26871790472821,
+    "std_visitation_entropy": 0.27074350153669263,
+    "mean_distinct_states": 33.72,
+    "mean_empowerment_visited": 2.682172992048602,
+    "std_empowerment_visited": 0.032133006645598775
+  },
+  {
+    "policy": "softmax",
+    "temperature": 3.0,
+    "epsilon": null,
+    "frac_reaching_far_basin": 0.33,
+    "mean_visitation_entropy": 3.2545112902096194,
+    "std_visitation_entropy": 0.27983553450883275,
+    "mean_distinct_states": 33.55,
+    "mean_empowerment_visited": 2.6517822945558005,
+    "std_empowerment_visited": 0.03869120938712457
+  },
+  {
+    "policy": "epsilon_greedy",
+    "temperature": null,
+    "epsilon": 0.1,
+    "frac_reaching_far_basin": 0.02,
+    "mean_visitation_entropy": 1.515950001589157,
+    "std_visitation_entropy": 0.09325473345657324,
+    "mean_distinct_states": 10.3,
+    "mean_empowerment_visited": 2.852101781848441,
+    "std_empowerment_visited": 0.003819332035815542
+  },
+  {
+    "policy": "epsilon_greedy",
+    "temperature": null,
+    "epsilon": 0.3,
+    "frac_reaching_far_basin": 0.25,
+    "mean_visitation_entropy": 2.027273900610481,
+    "std_visitation_entropy": 0.2821604292161681,
+    "mean_distinct_states": 16.92,
+    "mean_empowerment_visited": 2.8308798977544893,
+    "std_empowerment_visited": 0.008577693272526265
+  }
+]

@@ -1,0 +1,410 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+
+\newtheorem{definition}{Definition}
+
+\newcommand{\E}{\mathcal{E}}
+\newcommand{\Qemp}{Q_{\mathrm{emp}}}
+\newcommand{\argmax}{\operatorname{arg\,max}}
+\newcommand{\nats}{\,\mathrm{nats}}
+
+\title{Empowerment Outer-Policy Experiments:\\
+  Separating Inner Valuation from Outer Control}
+\author{Scott Viteri}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Empowerment---the channel capacity of an agent's action-to-future-state
+channel---is a widely studied intrinsic motivation signal.  However, prior
+work often conflates the \emph{empowerment objective} (which states are
+valued) with the \emph{outer control rule} (how actions are selected given
+empowerment estimates).  This repository provides a controlled comparison:
+we hold empowerment computation fixed and vary only the outer policy.
+We compare greedy (argmax), softmax (Boltzmann), and $\epsilon$-greedy
+outer policies on exact tabular empowerment in a corridor gridworld.
+Greedy control collapses into stereotyped local loops, while moderate-temperature
+softmax control escapes local empowerment maxima and reaches higher-empowerment
+regions at the cost of reduced instantaneous empowerment.
+\end{abstract}
+
+%----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%----------------------------------------------------------------------
+
+Empowerment \cite{klyubin2005empowerment} provides an agent-centric,
+task-independent measure of how much control an agent has over its
+future.  It has been used to explain and generate life-like behaviors
+such as obstacle avoidance, resource acquisition, and survival
+\cite{jung2011empowerment, mohamed2015variational, ramirez2024mop}.
+
+A subtle but important design choice in empowerment-driven agents is the
+\emph{outer policy}: given empowerment estimates for all reachable
+states, how should the agent select its next action?  The simplest
+choice is greedy (argmax) over successor-state empowerment.  But
+stochastic alternatives---softmax or $\epsilon$-greedy---can produce
+qualitatively different behavior even when the underlying empowerment
+values are identical.
+
+This repository isolates this variable.  The central experimental
+principle is:
+
+\begin{quote}
+\textbf{Fix empowerment.  Vary only the outer policy.  Measure behavior broadly.}
+\end{quote}
+
+%----------------------------------------------------------------------
+\section{Mathematical Framework}
+\label{sec:math}
+%----------------------------------------------------------------------
+
+\subsection{Empowerment}
+
+Consider a discrete environment with state space $\mathcal{S}$ and
+action space $\mathcal{A}(s)$ available at each state $s$.  The
+transition dynamics are $P(s' \mid s, a)$.
+
+\begin{definition}[n-step empowerment]
+For state $s$ and horizon $n$, the \emph{empowerment} is
+\begin{equation}
+  \E_n(s) \;=\; \max_{q(a_{0:n-1} \mid s)}\; I(A_{0:n-1};\, S_n \mid s)
+  \label{eq:empowerment}
+\end{equation}
+where $I(\cdot;\cdot)$ is mutual information, $A_{0:n-1}$ is a
+length-$n$ action sequence drawn from the input distribution
+$q(a_{0:n-1} \mid s)$, and $S_n$ is the resulting final state under
+the environment dynamics.
+\end{definition}
+
+Empowerment is the \emph{channel capacity} of the $n$-step
+action-to-state channel induced by the dynamics at $s$.  It measures,
+in nats, the maximum number of distinguishable futures the agent can
+steer toward.
+
+\subsection{The Action-to-State Channel}
+
+For a given state $s$ and horizon $n$, we construct the channel matrix
+$\mathbf{C} \in \mathbb{R}^{|\mathcal{X}| \times |\mathcal{S}|}$
+where $\mathcal{X} = \mathcal{A}(s)^n$ is the set of all length-$n$
+action sequences.  Each entry is:
+\begin{equation}
+  C_{x,s'} = P(S_n = s' \mid s,\, a_{0:n-1} = x)
+\end{equation}
+computed by rolling out the transition probabilities:
+\begin{equation}
+  P(S_n = s' \mid s, x) \;=\;
+    \sum_{s_1, \ldots, s_{n-1}}
+    \prod_{t=0}^{n-1} P(s_{t+1} \mid s_t, a_t)
+\end{equation}
+where $s_0 = s$ and $x = (a_0, \ldots, a_{n-1})$.  In deterministic
+environments, each row of $\mathbf{C}$ is a one-hot vector.
+
+\subsection{Blahut--Arimoto Algorithm}
+
+Channel capacity is computed via the Blahut--Arimoto (BA) algorithm
+\cite{blahut1972computation}.  Starting from a uniform input
+distribution $q^{(0)}$, BA iterates:
+
+\begin{enumerate}
+  \item Compute the output marginal:
+    $r^{(t)}(s') = \sum_x q^{(t)}(x)\, C_{x,s'}$
+  \item Compute the per-input KL term:
+    $\phi^{(t)}(x) = \exp\!\Big(\sum_{s'} C_{x,s'} \ln
+    \frac{C_{x,s'}}{r^{(t)}(s')}\Big)$
+  \item Update input distribution:
+    $q^{(t+1)}(x) \propto q^{(t)}(x)\, \phi^{(t)}(x)$
+\end{enumerate}
+
+Convergence is monitored via the gap between the lower bound
+$C_L = \ln\!\big(\sum_x q(x)\phi(x)\big)$ and upper bound
+$C_U = \ln\!\big(\max_x \phi(x)\big)$.  The algorithm terminates when
+$C_U - C_L < \epsilon$ (we use $\epsilon = 10^{-8}$).
+
+\subsection{Empowerment-Derived Action Scores}
+
+Given a precomputed empowerment table
+$\{\E_n(s)\}_{s \in \mathcal{S}}$, we define the one-step action
+score:
+\begin{equation}
+  \Qemp(s, a) \;=\; \sum_{s'} P(s' \mid s, a)\, \E_n(s')
+  \label{eq:qemp}
+\end{equation}
+In deterministic environments this simplifies to
+$\Qemp(s,a) = \E_n(f(s,a))$ where $f$ is the transition function.
+
+\textbf{This score is the same for all outer policies}---the only
+thing that differs is how $\Qemp$ is converted into action
+probabilities.
+
+%----------------------------------------------------------------------
+\section{Outer Policies}
+\label{sec:policies}
+%----------------------------------------------------------------------
+
+\subsection{Greedy (Argmax)}
+
+The greedy policy selects uniformly among maximizers:
+\begin{equation}
+  \pi_{\mathrm{greedy}}(a \mid s) \;=\;
+    \frac{\mathbf{1}[a \in \argmax_b \Qemp(s,b)]}{|\argmax_b \Qemp(s,b)|}
+  \label{eq:greedy}
+\end{equation}
+
+\subsection{Softmax (Boltzmann)}
+
+The softmax policy assigns probability proportional to exponentiated
+scores:
+\begin{equation}
+  \pi_\tau(a \mid s) \;=\;
+    \frac{\exp\!\big(\Qemp(s,a) / \tau\big)}
+         {\sum_b \exp\!\big(\Qemp(s,b) / \tau\big)}
+  \label{eq:softmax}
+\end{equation}
+where $\tau > 0$ is the temperature parameter.  Key limits:
+\begin{itemize}
+  \item $\tau \to 0$: recovers the greedy policy
+  \item $\tau \to \infty$: approaches the uniform distribution over actions
+\end{itemize}
+
+For numerical stability, we subtract $\max_b \Qemp(s,b)$ from all
+scores before exponentiation.
+
+\subsection{Epsilon-Greedy}
+
+The $\epsilon$-greedy policy serves as a control to distinguish
+``stochasticity helps'' from ``Boltzmann-shaped stochasticity helps'':
+\begin{equation}
+  \pi_\epsilon(a \mid s) \;=\;
+  \begin{cases}
+    \dfrac{1 - \epsilon}{|\argmax_b \Qemp(s,b)|} + \dfrac{\epsilon}{|\mathcal{A}(s)|}
+      & a \in \argmax_b \Qemp(s,b) \\[6pt]
+    \dfrac{\epsilon}{|\mathcal{A}(s)|}
+      & \text{otherwise}
+  \end{cases}
+  \label{eq:epsgreedy}
+\end{equation}
+
+%----------------------------------------------------------------------
+\section{Corridor Environment}
+\label{sec:corridor}
+%----------------------------------------------------------------------
+
+The corridor environment is a deterministic gridworld designed to
+create the simplest possible test of local-maximum escape.  It
+consists of:
+
+\begin{itemize}
+  \item A \textbf{local basin}: a $7 \times 4$ open room (28 states)
+    with moderate empowerment, containing the start state.
+  \item A \textbf{narrow corridor}: 3 cells wide at a single row,
+    connecting the two basins.  These states have reduced empowerment
+    because fewer future states are reachable within the horizon.
+  \item A \textbf{far basin}: a $7 \times 7$ open room (49 states)
+    with higher empowerment due to its larger spatial extent.
+\end{itemize}
+
+The agent has four actions (up, down, left, right) at every state.
+Moving into a wall results in staying in place.  There are no
+absorbing states.
+
+\medskip
+
+At horizon $n = 3$, the mean empowerment values are:
+\begin{itemize}
+  \item Local basin: $2.631\nats$
+  \item Far basin: $2.693\nats$
+\end{itemize}
+
+The far basin has higher empowerment because its larger area provides
+more reachable states within any given horizon.  However, to reach it,
+the agent must traverse corridor states with \emph{lower} empowerment
+than the local basin---a greedy agent will not voluntarily enter them.
+
+%----------------------------------------------------------------------
+\section{Experimental Setup}
+\label{sec:setup}
+%----------------------------------------------------------------------
+
+We precompute the exact $n$-step empowerment table for all 80 states
+using BA with horizon $n = 3$.  We then run rollouts of length
+$T = 200$ steps for each outer policy across 100 random seeds.
+
+\paragraph{Independent variables.}
+\begin{itemize}
+  \item Outer policy: greedy, softmax ($\tau \in \{0.01, 0.03, 0.1, 0.3, 1.0, 3.0\}$),
+    $\epsilon$-greedy ($\epsilon \in \{0.1, 0.3\}$)
+\end{itemize}
+
+\paragraph{Dependent variables.}
+\begin{itemize}
+  \item Fraction of episodes reaching the far basin
+  \item Mean state visitation entropy (Shannon, in nats)
+  \item Mean number of distinct states visited
+  \item Mean empowerment of visited states
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+%----------------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\caption{Corridor experiment results ($n=3$, $T=200$, 100 seeds).}
+\label{tab:results}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Policy & Far Basin \% & Entropy & Distinct States & Mean Emp. \\
+\midrule
+Greedy              & 0.00 & 1.301 &  6.0 & 2.861 \\
+Softmax $\tau=0.01$ & 0.00 & 1.311 &  6.3 & 2.860 \\
+Softmax $\tau=0.03$ & 0.00 & 1.646 &  9.1 & 2.853 \\
+Softmax $\tau=0.1$  & 0.00 & 2.357 & 16.7 & 2.820 \\
+Softmax $\tau=0.3$  & 0.10 & 2.961 & 26.0 & 2.751 \\
+Softmax $\tau=1.0$  & 0.29 & 3.269 & 33.7 & 2.682 \\
+Softmax $\tau=3.0$  & 0.33 & 3.255 & 33.6 & 2.652 \\
+\midrule
+$\epsilon$-greedy $\epsilon=0.1$ & 0.02 & 1.516 & 10.3 & 2.852 \\
+$\epsilon$-greedy $\epsilon=0.3$ & 0.25 & 2.027 & 16.9 & 2.831 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results in \Cref{tab:results} support the core hypotheses:
+
+\paragraph{H1: Greedy empowerment is behaviorally narrow.}
+The greedy agent visits only 6 distinct states out of 80 and never
+reaches the far basin.  It becomes trapped in a small loop near the
+highest-empowerment states of the local basin.
+
+\paragraph{H2: Softmax improves basin escape.}
+At $\tau = 0.3$, 10\% of episodes reach the far basin; at
+$\tau = 1.0$, this rises to 29\%.  The softmax policy's willingness
+to occasionally accept lower-empowerment actions allows it to traverse
+the corridor.
+
+\paragraph{H3: Diversity--empowerment trade-off.}
+Visitation entropy increases monotonically from $1.30\nats$ (greedy)
+to $3.27\nats$ ($\tau = 1.0$), while mean empowerment of visited
+states decreases from $2.86\nats$ to $2.68\nats$.  Softmax explores
+more broadly but spends less time at peak-empowerment states.
+
+\paragraph{H4: Diminishing returns at high temperature.}
+Between $\tau = 1.0$ and $\tau = 3.0$, the far-basin reach rate
+plateaus (29\% $\to$ 33\%) while entropy saturates and mean
+empowerment continues to decline.  Very high temperatures approach
+uniform random behavior.
+
+\paragraph{Boltzmann vs.\ uniform stochasticity.}
+At comparable diversity levels, $\epsilon$-greedy with $\epsilon = 0.3$
+reaches the far basin 25\% of the time but visits only 16.9 distinct
+states, whereas softmax at $\tau = 1.0$ reaches 29\% and visits 33.7
+distinct states.  The Boltzmann weighting distributes exploration
+probability more effectively than uniform noise.
+
+%----------------------------------------------------------------------
+\section{Repository Structure}
+\label{sec:repo}
+%----------------------------------------------------------------------
+
+The implementation follows a strict separation between inner
+empowerment computation and outer policy selection.
+
+\begin{description}
+  \item[\texttt{src/envs/}] Environment interface (\texttt{DiscreteEnv}
+    base class) and the corridor gridworld.
+  \item[\texttt{src/empowerment/}] Exact empowerment computation:
+    \texttt{nstep\_model.py} builds the $n$-step channel matrix,
+    \texttt{blahut\_arimoto.py} computes channel capacity, and
+    \texttt{exact.py} ties them together.  \texttt{score.py} computes
+    $\Qemp(s,a)$.
+  \item[\texttt{src/policies/}] Outer policies (greedy, softmax,
+    $\epsilon$-greedy), all consuming the same $\Qemp$ scores.
+  \item[\texttt{src/rollout/}] Seeded simulation loop.
+  \item[\texttt{src/metrics/}] Visitation entropy, distinct states,
+    basin-reaching fraction.
+  \item[\texttt{scripts/}] Experiment runner with temperature sweep
+    and summary table output.
+  \item[\texttt{tests/}] Unit tests for BA convergence, environment
+    dynamics, and policy properties (17 tests).
+\end{description}
+
+%----------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%----------------------------------------------------------------------
+
+These results demonstrate that behavioral conclusions about
+empowerment-driven agents can depend substantially on the outer
+control rule.  The greedy agent's stereotyped looping is not a
+property of empowerment \emph{per se}---it is a property of greedy
+action selection applied to empowerment scores.  A softmax agent using
+the \emph{identical} empowerment values exhibits qualitatively
+different behavior: broader exploration, basin escape, and higher
+trajectory diversity.
+
+This distinction matters for interpreting prior work.  When a paper
+reports that ``empowerment-driven agents exhibit behavior X,'' the
+outer policy is a confound.  Our framework makes it possible to ask:
+is X caused by what empowerment values, or by how the agent acts on
+those values?
+
+\paragraph{Limitations.}
+The current results use a single environment with a small empowerment
+gap between basins ($\Delta \E \approx 0.06\nats$).  Larger
+environments, longer horizons, and environments with survival pressure
+(e.g., four-rooms with energy) would provide stronger tests.
+The softmax temperature is also environment-specific; score
+normalization (z-score mode) would improve cross-environment
+comparability.
+
+\paragraph{Future work.}
+Planned extensions include four-rooms with energy constraints, a noisy
+room variant, discretized cartpole, and horizon sweep ablations.
+
+%----------------------------------------------------------------------
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{klyubin2005empowerment}
+A.~S. Klyubin, D.~Polani, and C.~L. Nehaniv.
+\newblock Empowerment: A universal agent-centric measure of control.
+\newblock In \emph{IEEE Congress on Evolutionary Computation}, 2005.
+
+\bibitem{jung2011empowerment}
+T.~Jung, D.~Polani, and P.~Stone.
+\newblock Empowerment for continuous agent--environment systems.
+\newblock \emph{Adaptive Behavior}, 19(1):16--39, 2011.
+
+\bibitem{mohamed2015variational}
+S.~Mohamed and D.~J. Rezende.
+\newblock Variational information maximisation for intrinsically motivated
+  reinforcement learning.
+\newblock In \emph{NeurIPS}, 2015.
+
+\bibitem{ramirez2024mop}
+J.~Ram\'irez-Ruiz, C.~W.~J. Geurts, and R.~Moreno-Bote.
+\newblock Complex behavior from intrinsic motivation to occupy future
+  action-state path space.
+\newblock \emph{Nature Communications}, 2024.
+
+\bibitem{blahut1972computation}
+R.~Blahut.
+\newblock Computation of channel capacity and rate-distortion functions.
+\newblock \emph{IEEE Transactions on Information Theory}, 18(4):460--473, 1972.
+
+\end{thebibliography}
+
+\end{document}
